@@ -27,7 +27,7 @@ stride_gpt/                 # CLI package + shared library
 │   ├── progress.py         # Rich-based progress callbacks
 │   └── report.py           # markdown / JSON / SARIF rendering, save/load
 └── core/                   # shared between CLI and web
-    ├── llm.py              # unified call_llm / call_llm_with_tools via litellm
+    ├── llm.py              # unified call_llm / call_llm_with_tools (OpenAI SDK)
     ├── schemas.py          # LLMConfig, AnalysisPlan, AnalysisReport, etc.
     ├── prompts/
     │   ├── builder.py      # legacy single-shot prompt builder (web UI uses this)
@@ -144,19 +144,22 @@ The pattern is decoupled from threat modelling. The recipe:
 
 ## LLM provider abstraction
 
-Everything goes through `stride_gpt/core/llm.py` — `call_llm`, `call_llm_with_tools`, `call_llm_with_image`. Under the hood these use `litellm.completion` with provider-aware kwargs assembled in `_build_litellm_kwargs`. **Never call `litellm.completion` directly** from outside `core/llm.py` — that's how provider-specific quirks leak across the codebase.
+Everything goes through `stride_gpt/core/llm.py` — `call_llm`, `call_llm_with_tools`, `call_llm_with_image`. Under the hood these use the official OpenAI SDK. **Never construct `OpenAI()` outside `core/llm.py`** — that's how provider-specific quirks leak across the codebase.
 
-Models are registered in `stride_gpt/models.py` with provider, default tokens, max tokens, and capability flags (`supports_thinking`, etc.).
+- **OpenAI API** → native Responses API (`client.responses.create`, `store=False`). Agent history stays in Chat Completions shape and is converted at this boundary (`messages_to_responses_input`, flat function tools).
+- **Mistral / Groq / DeepSeek / LM Studio** → Chat Completions against each provider's OpenAI-compatible `base_url`.
+
+Models are registered in `stride_gpt/models.py` with provider, default tokens, max tokens, and capability flags (`uses_max_completion_tokens`, `uses_responses`).
 
 ### Provider gotchas
 
-- **Gemini does NOT accept the Anthropic-shaped `thinking={"type": "enabled", ...}` kwarg.** litellm rejects it for newer models (e.g. `gemini-3.1-flash-lite`). Thinking-capable Gemini models have thinking on by default and surface it via `thinking_blocks` on the response. Don't send the kwarg.
-- **Anthropic with `use_thinking=True` requires `max_tokens > budget_tokens`.** `_build_litellm_kwargs` enforces 48000 as the floor when thinking is on.
-- **GPT-5 series uses `max_completion_tokens`, not `max_tokens`.** Driven off `model_uses_completion_tokens` in the model registry.
-- **LM Studio only accepts `json_schema` or `text` response_format**, not `json_object`. Branch in `_build_litellm_kwargs`.
+- **OpenAI Responses must set `store=False`.** Default storage would persist threat-model prompts (including source) on OpenAI's side.
+- **GPT-5 series uses `max_output_tokens` on Responses** (and `max_completion_tokens` on Chat Completions). Driven off `model_uses_completion_tokens` in the model registry.
+- **LM Studio only accepts `json_schema` or `text` response_format**, not `json_object`. Branch in `_json_response_format`.
 - **Groq DeepSeek emits `<think>` tags inline.** Extracted by `extract_deepseek_reasoning`.
+- **LM Studio needs a placeholder API key.** The OpenAI SDK refuses to build a client without one even for localhost.
 
-When adding a new provider or model, the kwarg shape almost always needs a new branch in `_build_litellm_kwargs`. Don't try to make it generic — provider quirks are real and pretending they aren't causes silent bugs.
+When adding a new OpenAI-compatible provider, add `chat_api_base` + `cli_prefix` on `ProviderInfo` and a `ModelInfo` list. Don't send Responses-only kwargs (`store`, `text.format`, flat tools) to Chat Completions endpoints.
 
 ## Adding a feature — orientation
 

@@ -63,8 +63,7 @@ flowchart TD
     A[User Input] -->|App description,<br/>diagram, or<br/>GitHub repo| B[Prompt Builder]
     B -->|apps/web/threat_model.py<br/>apps/web/mitigations.py<br/>etc.| C{LLM Provider}
     C -->|OpenAI| D[JSON Response]
-    C -->|Anthropic| D
-    C -->|Google/Mistral/Groq| D
+    C -->|Mistral/Groq/DeepSeek| D
     C -->|LM Studio| D
     D --> E[Markdown Converter]
     E --> F[Display Results]
@@ -580,7 +579,7 @@ docker run -p 8501:8501 \
 ```
 
 **API Keys needed:**
-- LLM provider keys (OpenAI, Anthropic, Google, etc.)
+- LLM provider keys (OpenAI, Groq, Mistral, DeepSeek, etc.)
 - Optional: GitHub token for repository analysis
 - Optional: LM Studio endpoint for local models
 

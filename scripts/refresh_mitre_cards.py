@@ -15,7 +15,7 @@ Usage::
     python scripts/refresh_mitre_cards.py --attack PATH --atlas PATH  # offline
     python scripts/refresh_mitre_cards.py --print-only                # don't write
 
-Requires PyYAML (transitively available via litellm). The script imports
+Requires PyYAML. The script imports
 ``yaml`` lazily so the build-time-only dependency doesn't reach runtime.
 """
 
