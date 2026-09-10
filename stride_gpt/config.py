@@ -20,8 +20,8 @@ CONFIG_DIR = Path.home() / ".stride-gpt"
 
 
 def friendly_provider(provider_key: str) -> str:
-    """Map a LiteLLM provider_key ('Google AI API') to its friendly display
-    name ('Google AI'). Falls back to stripping a trailing ' API' / ' Server'
+    """Map a provider_key ('OpenAI API') to its friendly display
+    name ('OpenAI'). Falls back to stripping a trailing ' API' / ' Server'
     suffix so unregistered providers still render cleanly."""
     for info in PROVIDERS.values():
         if info.provider_key == provider_key:
@@ -30,6 +30,7 @@ def friendly_provider(provider_key: str) -> str:
         if provider_key.endswith(suffix):
             return provider_key[: -len(suffix)]
     return provider_key
+
 CONFIG_FILE = CONFIG_DIR / "config.json"
 # Reports are split by kind so a coding agent pointed at the "analyze" folder
 # only sees codebase-grounded reports (which all relate to the same project),
@@ -564,7 +565,7 @@ def get_api_key(config: dict[str, Any], *, tier: str = "worker") -> str:
         return ""
 
     # Worker tier — last-resort common env vars (legacy behaviour)
-    for var in ("STRIDE_GPT_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+    for var in ("STRIDE_GPT_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "DEEPSEEK_API_KEY"):
         key = os.environ.get(var, "")
         if key:
             return key

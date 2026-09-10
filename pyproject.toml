@@ -18,7 +18,7 @@ classifiers = [
 ]
 dependencies = [
     "httpx>=0.27",
-    "litellm>=1.40",
+    "openai>=1.0",
     "pydantic>=2.0",
     "python-dotenv>=1.0",
     "typer>=0.15",
@@ -45,13 +45,10 @@ dev = [
 # never shipped in the wheel. Streamlit Community Cloud, the Docker UI image
 # (Dockerfile.ui), and the security-scan workflow all install these from
 # uv.lock, which is the single source of truth for every dependency. Deps
-# already in [project.dependencies] (httpx, litellm, pydantic, python-dotenv,
+# already in [project.dependencies] (httpx, openai, pydantic, python-dotenv,
 # defusedxml) are not repeated here.
 web = [
     "streamlit>=1.58.0",
-    "openai",
-    "anthropic",
-    "groq",
     "pyGithub",
     "tiktoken",
     "requests>=2.34.2",
@@ -74,9 +71,6 @@ constraint-dependencies = [
     # through 3.1.57 (arbitrary file overwrite, env-var exfiltration,
     # git-config injection).
     "gitpython>=3.1.60",
-    # aiohttp via litellm: out-of-bounds heap read in the C response parser
-    # (<=3.14.2), request smuggling and unnegotiated compressed frames (<=3.14.1).
-    "aiohttp>=3.14.3",
     # cryptography via pyjwt: Bleichenbacher oracle in PKCS#7 EnvelopedData
     # decryption (<50.0.0).
     "cryptography>=50.0.1",

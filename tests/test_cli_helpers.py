@@ -23,11 +23,9 @@ class TestResolveProvider:
     @pytest.mark.parametrize(
         "model, expected_provider, expected_name",
         [
-            ("anthropic/claude-x", "Anthropic API", "claude-x"),
             ("mistral/large", "Mistral API", "large"),
             ("groq/llama", "Groq API", "llama"),
             ("openai/gpt-x", "OpenAI API", "gpt-x"),
-            ("google/gemini-x", "Google AI API", "gemini-x"),
             ("deepseek/deepseek-v4-pro", "DeepSeek API", "deepseek-v4-pro"),
         ],
     )
@@ -59,7 +57,7 @@ class TestBuildModelPair:
         monkeypatch.setattr(cli, "load_config", lambda: None)
         with pytest.raises(typer.Exit) as exc:
             cli._build_model_pair(
-                worker_model="anthropic/claude-x",
+                worker_model="groq/llama-x",
                 worker_api_key="k",
                 architect_api_key="only-key-no-model",
             )
@@ -69,9 +67,9 @@ class TestBuildModelPair:
         monkeypatch.setattr(cli, "load_config", lambda: None)
         with pytest.raises(typer.Exit) as exc:
             cli._build_model_pair(
-                worker_model="anthropic/claude-x",
+                worker_model="groq/llama-x",
                 worker_api_key="k",
-                architect_model="anthropic/opus",
+                architect_model="openai/gpt-5.5",
                 no_architect=True,
             )
         assert exc.value.exit_code == 2
@@ -86,17 +84,17 @@ class TestBuildModelPair:
         monkeypatch.setattr(cli, "load_config", lambda: None)
         monkeypatch.setattr("stride_gpt.config.get_api_key", lambda *a, **k: "")
         with pytest.raises(typer.Exit) as exc:
-            cli._build_model_pair(worker_model="anthropic/claude-x")
+            cli._build_model_pair(worker_model="groq/llama-x")
         assert exc.value.exit_code == 1
 
     def test_explicit_worker_key_builds_single_tier_pair(self, monkeypatch):
         monkeypatch.setattr(cli, "load_config", lambda: None)
         pair = cli._build_model_pair(
-            worker_model="anthropic/claude-x", worker_api_key="sk-worker"
+            worker_model="groq/llama-x", worker_api_key="sk-worker"
         )
         assert isinstance(pair, ModelPair)
-        assert pair.worker.provider == "Anthropic API"
-        assert pair.worker.model_name == "claude-x"
+        assert pair.worker.provider == "Groq API"
+        assert pair.worker.model_name == "llama-x"
         assert pair.worker.api_key == "sk-worker"
         assert pair.architect is None
 
@@ -115,13 +113,13 @@ class TestBuildModelPair:
 
     def test_worker_falls_back_to_saved_config(self, monkeypatch):
         saved = {
-            "worker_provider_key": "Anthropic API",
-            "worker_model": "saved-sonnet",
+            "worker_provider_key": "Groq API",
+            "worker_model": "saved-llama",
         }
         monkeypatch.setattr(cli, "load_config", lambda: saved)
         monkeypatch.setattr("stride_gpt.config.get_api_key", lambda *a, **k: "sk-saved")
         pair = cli._build_model_pair()
-        assert pair.worker.model_name == "saved-sonnet"
+        assert pair.worker.model_name == "saved-llama"
         assert pair.worker.api_key == "sk-saved"
 
 
@@ -130,7 +128,7 @@ class TestBuildModelPair:
 # ---------------------------------------------------------------------------
 
 
-def _cfg(provider="Anthropic API", key="sk-x"):
+def _cfg(provider="Groq API", key="sk-x"):
     return LLMConfig(provider=provider, model_name="m", api_key=key)
 
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 from enum import Enum
 
 import httpx
-import litellm
 
 from stride_gpt.core.llm import call_llm
 from stride_gpt.core.schemas import LLMConfig
@@ -24,6 +23,32 @@ DEFAULT_LIMITS: dict[str, int] = {
 
 COMPRESSION_THRESHOLD = 0.80  # Compress when at 80% of limit
 KEEP_RECENT = 6  # Number of recent messages to keep uncompressed
+
+
+def count_message_tokens(messages: list[dict]) -> int:
+    """Approximate tokens in a Chat Completions-shaped message list.
+
+    ~4 characters per token. Counts string content, text parts, and tool-call
+    arguments so compression still fires on tool-heavy histories.
+    """
+    total_chars = 0
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    total_chars += len(str(part.get("text", "")))
+                else:
+                    total_chars += len(str(part))
+        elif content is not None:
+            total_chars += len(str(content))
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            if isinstance(fn, dict):
+                total_chars += len(str(fn.get("arguments", "")))
+    return max(0, total_chars // 4)
 
 
 class TokenBudgetSource(Enum):
@@ -46,13 +71,8 @@ class ContextManager:
             self.context_window, self.budget_source = self._resolve_limit(config)
 
     def count_tokens(self, messages: list[dict]) -> int:
-        """Count tokens in a message list using LiteLLM's counter."""
-        try:
-            return litellm.token_counter(model=self.model, messages=messages)
-        except Exception:
-            # Rough fallback: ~4 chars per token
-            total_chars = sum(len(str(m.get("content", ""))) for m in messages)
-            return total_chars // 4
+        """Approximate tokens in a message list (~4 chars per token)."""
+        return count_message_tokens(messages)
 
     def needs_compression(self, messages: list[dict]) -> bool:
         """Check if messages are approaching the context limit."""

@@ -70,12 +70,12 @@ def test_redact_path_outside_cwd_and_home(tmp_path, monkeypatch):
 
 
 def _make_pair(
-    worker_model: str = "claude-sonnet-4-5",
+    worker_model: str = "gpt-5.4",
     api_key: str = "sk-test",
 ) -> ModelPair:
     return ModelPair(
         worker=LLMConfig(
-            provider="Anthropic API", model_name=worker_model, api_key=api_key,
+            provider="OpenAI API", model_name=worker_model, api_key=api_key,
         ),
     )
 
@@ -96,10 +96,10 @@ def test_config_hash_changes_with_prompt():
 
 def test_config_hash_changes_with_model():
     a = compute_config_hash(
-        system_prompt="P", models=_make_pair("claude-sonnet-4-5"), references=[],
+        system_prompt="P", models=_make_pair("gpt-5.4"), references=[],
     )
     b = compute_config_hash(
-        system_prompt="P", models=_make_pair("claude-opus-4-7"), references=[],
+        system_prompt="P", models=_make_pair("gpt-5.5"), references=[],
     )
     assert a != b
 
@@ -329,8 +329,8 @@ def test_run_manifest_round_trip():
         python_version="3.12.0",
         started_at=datetime(2026, 6, 15, 12, 0, tzinfo=UTC),
         finished_at=datetime(2026, 6, 15, 12, 5, tzinfo=UTC),
-        architect=ModelDescriptor(provider="Anthropic API", model_name="opus"),
-        worker=ModelDescriptor(provider="Anthropic API", model_name="sonnet"),
+        architect=ModelDescriptor(provider="OpenAI API", model_name="gpt-5.5"),
+        worker=ModelDescriptor(provider="OpenAI API", model_name="gpt-5.4"),
         detected_app_type="agentic",
         app_type_source="override:agentic",
         target_path="./",

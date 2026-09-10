@@ -17,9 +17,9 @@ from stride_gpt.config import (
 @pytest.fixture
 def single_tier_config():
     return {
-        "worker_provider": "Anthropic",
-        "worker_provider_key": "Anthropic API",
-        "worker_model": "claude-sonnet-4-6",
+        "worker_provider": "Groq",
+        "worker_provider_key": "Groq API",
+        "worker_model": "llama-3.3-70b-versatile",
         "worker_api_base": None,
         "worker_max_tokens": None,
     }
@@ -28,14 +28,14 @@ def single_tier_config():
 @pytest.fixture
 def tiered_config():
     return {
-        "worker_provider": "Anthropic",
-        "worker_provider_key": "Anthropic API",
-        "worker_model": "claude-sonnet-4-6",
+        "worker_provider": "Groq",
+        "worker_provider_key": "Groq API",
+        "worker_model": "llama-3.3-70b-versatile",
         "worker_api_base": None,
         "worker_max_tokens": None,
         "architect_provider": "OpenAI",
         "architect_provider_key": "OpenAI API",
-        "architect_model": "gpt-5",
+        "architect_model": "gpt-5.5",
         "architect_api_base": None,
         "architect_max_tokens": None,
     }
@@ -46,28 +46,28 @@ class TestConfigToModelPair:
         assert config_to_model_pair({}) is None
 
     def test_single_tier_yields_no_architect(self, single_tier_config, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-key")
+        monkeypatch.setenv("GROQ_API_KEY", "groq-key")
         pair = config_to_model_pair(single_tier_config)
         assert pair is not None
         assert pair.architect is None
         assert pair.tiered is False
-        assert pair.worker.model_name == "claude-sonnet-4-6"
-        assert pair.worker.api_key == "ant-key"
+        assert pair.worker.model_name == "llama-3.3-70b-versatile"
+        assert pair.worker.api_key == "groq-key"
         assert pair.for_architect() is pair.worker
 
     def test_tiered_yields_architect(self, tiered_config, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-key")
+        monkeypatch.setenv("GROQ_API_KEY", "groq-key")
         monkeypatch.setenv("OPENAI_API_KEY", "oai-key")
         pair = config_to_model_pair(tiered_config)
         assert pair is not None
         assert pair.tiered
         assert pair.architect is not None
-        assert pair.architect.model_name == "gpt-5"
+        assert pair.architect.model_name == "gpt-5.5"
         assert pair.architect.api_key == "oai-key"
-        assert pair.worker.api_key == "ant-key"
+        assert pair.worker.api_key == "groq-key"
 
     def test_null_architect_model_treated_as_single_tier(self, tiered_config, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-key")
+        monkeypatch.setenv("GROQ_API_KEY", "groq-key")
         tiered_config["architect_model"] = None
         pair = config_to_model_pair(tiered_config)
         assert pair is not None
@@ -77,34 +77,34 @@ class TestConfigToModelPair:
 
 class TestGetApiKey:
     def test_worker_reads_provider_env_var(self, single_tier_config, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "real-key")
+        monkeypatch.setenv("GROQ_API_KEY", "real-key")
         assert get_api_key(single_tier_config, tier="worker") == "real-key"
 
     def test_architect_reads_own_env_var(self, tiered_config, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-key")
+        monkeypatch.setenv("GROQ_API_KEY", "groq-key")
         monkeypatch.setenv("OPENAI_API_KEY", "oai-key")
         assert get_api_key(tiered_config, tier="architect") == "oai-key"
 
     def test_architect_falls_back_to_worker_only_when_same_provider(self, monkeypatch):
         cfg = {
-            "worker_provider": "Anthropic",
-            "worker_provider_key": "Anthropic API",
-            "architect_provider": "Anthropic",
-            "architect_provider_key": "Anthropic API",
+            "worker_provider": "Groq",
+            "worker_provider_key": "Groq API",
+            "architect_provider": "Groq",
+            "architect_provider_key": "Groq API",
         }
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "shared-key")
+        monkeypatch.setenv("GROQ_API_KEY", "shared-key")
         assert get_api_key(cfg, tier="architect") == "shared-key"
 
     def test_architect_does_not_reuse_key_across_providers(self, monkeypatch):
         cfg = {
-            "worker_provider": "Anthropic",
-            "worker_provider_key": "Anthropic API",
+            "worker_provider": "Groq",
+            "worker_provider_key": "Groq API",
             "architect_provider": "OpenAI",
             "architect_provider_key": "OpenAI API",
         }
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-key")
+        monkeypatch.setenv("GROQ_API_KEY", "groq-key")
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        # Architect must NOT receive the Anthropic key.
+        # Architect must NOT receive the Groq key.
         assert get_api_key(cfg, tier="architect") == ""
 
 
@@ -122,7 +122,7 @@ class TestGetApiKeyLocalProvider:
         }
 
     def test_returns_empty_when_no_keys_set(self, monkeypatch):
-        for var in ("ANTHROPIC_API_KEY", "STRIDE_GPT_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+        for var in ("GROQ_API_KEY", "STRIDE_GPT_API_KEY", "OPENAI_API_KEY", "MISTRAL_API_KEY"):
             monkeypatch.delenv(var, raising=False)
         assert get_api_key(self._lm_studio_config(), tier="worker") == ""
 
@@ -130,7 +130,7 @@ class TestGetApiKeyLocalProvider:
         # api_base can point at any host, so the worker fallback chain must not
         # hand a real cloud key to it.
         monkeypatch.setenv("OPENAI_API_KEY", "sk-real-openai")
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-real-anthropic")
+        monkeypatch.setenv("GROQ_API_KEY", "sk-real-groq")
         monkeypatch.setenv("STRIDE_GPT_API_KEY", "sk-real-generic")
         assert get_api_key(self._lm_studio_config(), tier="worker") == ""
 
@@ -142,17 +142,18 @@ class TestGetApiKeyWorkerFallback:
     @staticmethod
     def _clear_all(monkeypatch):
         for var in (
-            "ANTHROPIC_API_KEY",
+            "GROQ_API_KEY",
             "STRIDE_GPT_API_KEY",
             "OPENAI_API_KEY",
-            "GOOGLE_API_KEY",
+            "MISTRAL_API_KEY",
+            "DEEPSEEK_API_KEY",
         ):
             monkeypatch.delenv(var, raising=False)
 
     def test_falls_back_to_generic_env_var_when_provider_var_unset(
         self, single_tier_config, monkeypatch
     ):
-        # Anthropic's own ANTHROPIC_API_KEY is unset, so the worker falls back
+        # Groq's own GROQ_API_KEY is unset, so the worker falls back
         # to the generic STRIDE_GPT_API_KEY.
         self._clear_all(monkeypatch)
         monkeypatch.setenv("STRIDE_GPT_API_KEY", "generic-key")
@@ -173,7 +174,7 @@ class TestGetApiKeyWorkerFallback:
         # When the provider's own env var IS set, the generic fallback is never
         # consulted — no risk of the wrong key winning.
         self._clear_all(monkeypatch)
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "provider-key")
+        monkeypatch.setenv("GROQ_API_KEY", "provider-key")
         monkeypatch.setenv("STRIDE_GPT_API_KEY", "generic-key")
         assert get_api_key(single_tier_config, tier="worker") == "provider-key"
 

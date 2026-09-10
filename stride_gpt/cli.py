@@ -701,15 +701,14 @@ def _handle_quick(config: dict, args_str: str) -> None:
 
 def _resolve_provider(model: str) -> tuple[str, str]:
     """Infer provider and bare model name from a prefixed model string."""
-    prefixes = {
-        "anthropic/": "Anthropic API",
-        "mistral/": "Mistral API",
-        "groq/": "Groq API",
-        "openai/": "OpenAI API",
-        "google/": "Google AI API",
-        "deepseek/": "DeepSeek API",
-    }
-    for prefix, provider in prefixes.items():
+    from stride_gpt.models import PROVIDERS
+
+    prefixes = sorted(
+        ((p.cli_prefix, p.provider_key) for p in PROVIDERS.values() if p.cli_prefix),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+    for prefix, provider in prefixes:
         if model.startswith(prefix):
             return provider, model[len(prefix):]
     return "OpenAI API", model
@@ -718,7 +717,7 @@ def _resolve_provider(model: str) -> tuple[str, str]:
 @app.command()
 def analyze(
     path: Annotated[Path, typer.Argument(help="Path to the codebase to analyze.")] = Path(),
-    worker_model: Annotated[str | None, typer.Option(help="Worker model — default tier, handles the bulk of calls (e.g. anthropic/claude-sonnet-4-6). A fast, low-cost model usually pays off here. Uses saved config if omitted.")] = None,
+    worker_model: Annotated[str | None, typer.Option(help="Worker model — default tier, handles the bulk of calls (e.g. groq/llama-3.3-70b-versatile). A fast, low-cost model usually pays off here. Uses saved config if omitted.")] = None,
     worker_api_key: Annotated[str | None, typer.Option(envvar="STRIDE_GPT_API_KEY", help="Worker API key.")] = None,
     worker_api_base: Annotated[str | None, typer.Option(help="Worker API base URL (LM Studio).")] = None,
     worker_max_tokens: Annotated[int | None, typer.Option(help="Worker per-call output token cap.")] = None,

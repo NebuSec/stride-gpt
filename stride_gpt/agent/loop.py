@@ -539,11 +539,10 @@ def _truncate_findings_to_fit(
     and let the provider error than crash mid-synthesis here.
     """
     try:
-        import litellm
         ctx = ContextManager(config=architect)
         budget = int(ctx.context_window * COMPRESSION_BUDGET)
         messages = [{"role": "user", "content": rendered}]
-        if litellm.token_counter(model=architect.model_name, messages=messages) <= budget:
+        if ctx.count_tokens(messages) <= budget:
             return rendered
 
         return json.dumps(

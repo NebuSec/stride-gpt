@@ -7,7 +7,6 @@ from unittest.mock import patch
 import pytest
 
 from stride_gpt.agent.context import (
-    COMPRESSION_THRESHOLD,
     DEFAULT_LIMITS,
     KEEP_RECENT,
     ContextManager,
@@ -15,8 +14,8 @@ from stride_gpt.agent.context import (
 from stride_gpt.core.schemas import LLMConfig, LLMResponse
 
 
-def _make_config(model: str = "claude-sonnet-4-5-20250929") -> LLMConfig:
-    return LLMConfig(provider="Anthropic API", model_name=model, api_key="test")
+def _make_config(model: str = "gpt-5.4") -> LLMConfig:
+    return LLMConfig(provider="OpenAI API", model_name=model, api_key="test")
 
 
 @pytest.fixture
@@ -36,23 +35,23 @@ def ctx_small():
 
 
 class TestResolveLimit:
-    def test_registered_claude_model(self):
+    def test_registered_gpt_model(self):
         from stride_gpt.models import get_model
 
-        ctx = ContextManager(config=_make_config("claude-sonnet-4-6"))
-        expected = get_model("Anthropic API", "claude-sonnet-4-6").max_tokens
+        ctx = ContextManager(config=_make_config("gpt-5.4"))
+        expected = get_model("OpenAI API", "gpt-5.4").max_tokens
         assert ctx.context_window == expected
 
-    def test_registered_gemini_model(self):
+    def test_registered_mistral_model(self):
         from stride_gpt.models import get_model
 
-        cfg = LLMConfig(provider="Google AI API", model_name="gemini-3.1-pro-preview", api_key="test")
+        cfg = LLMConfig(provider="Mistral API", model_name="mistral-small-2603", api_key="test")
         ctx = ContextManager(config=cfg)
-        expected = get_model("Google AI API", "gemini-3.1-pro-preview").max_tokens
+        expected = get_model("Mistral API", "mistral-small-2603").max_tokens
         assert ctx.context_window == expected
 
     def test_unregistered_claude_falls_back_to_name_inference(self):
-        # Old/custom Claude model not in the registry → keyword match wins
+        # Custom Claude-named local model not in the registry → keyword match wins
         ctx = ContextManager(config=_make_config("claude-sonnet-4-5-20250929"))
         assert ctx.context_window == DEFAULT_LIMITS["claude"]
 
@@ -71,9 +70,7 @@ class TestResolveLimit:
 
 
 class TestCountTokens:
-    @patch("stride_gpt.agent.context.litellm")
-    def test_fallback_on_error(self, mock_litellm, ctx):
-        mock_litellm.token_counter.side_effect = Exception("boom")
+    def test_four_chars_per_token(self, ctx):
         msgs = [{"role": "user", "content": "a" * 400}]
         result = ctx.count_tokens(msgs)
         assert result == 100  # 400 chars / 4
@@ -85,16 +82,12 @@ class TestCountTokens:
 
 
 class TestNeedsCompression:
-    @patch("stride_gpt.agent.context.litellm")
-    def test_under_threshold(self, mock_litellm, ctx):
-        mock_litellm.token_counter.return_value = 10
+    def test_under_threshold(self, ctx):
         assert ctx.needs_compression([{"role": "user", "content": "hi"}]) is False
 
-    @patch("stride_gpt.agent.context.litellm")
-    def test_over_threshold(self, mock_litellm, ctx):
-        threshold = int(ctx.context_window * COMPRESSION_THRESHOLD) + 1
-        mock_litellm.token_counter.return_value = threshold
-        assert ctx.needs_compression([{"role": "user", "content": "hi"}]) is True
+    def test_over_threshold(self, ctx_small):
+        msgs = [{"role": "user", "content": "a" * 500}]
+        assert ctx_small.needs_compression(msgs) is True
 
 
 # ---------------------------------------------------------------------------

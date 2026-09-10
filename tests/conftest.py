@@ -20,8 +20,8 @@ from stride_gpt.core.schemas import (
 def llm_config() -> LLMConfig:
     """Minimal LLMConfig for tests — no real API calls."""
     return LLMConfig(
-        provider="Anthropic API",
-        model_name="claude-sonnet-4-5-20250929",
+        provider="OpenAI API",
+        model_name="gpt-5.4",
         api_key="sk-test-fake-key",
     )
 
@@ -30,8 +30,8 @@ def llm_config() -> LLMConfig:
 def architect_config() -> LLMConfig:
     """Architect-tier LLMConfig — a distinct model so tier routing is observable."""
     return LLMConfig(
-        provider="Anthropic API",
-        model_name="claude-opus-4-7",
+        provider="OpenAI API",
+        model_name="gpt-5.5",
         api_key="sk-test-fake-key-architect",
     )
 
@@ -105,8 +105,8 @@ def sample_report(sample_plan, sample_finding) -> AnalysisReport:
             }
         ],
         metadata={
-            "worker_model": "claude-sonnet-4-5-20250929",
-            "worker_provider": "Anthropic API",
+            "worker_model": "gpt-5.4",
+            "worker_provider": "OpenAI API",
             "architect_model": None,
             "architect_provider": None,
             "llm_calls": 5,

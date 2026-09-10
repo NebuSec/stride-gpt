@@ -11,12 +11,11 @@ from pydantic import BaseModel
 class LLMConfig(BaseModel):
     """Configuration for an LLM call. Constructed by UI layer from session state."""
 
-    provider: str  # "OpenAI API", "Anthropic API", "Google AI API", etc.
-    model_name: str  # bare name e.g. "gpt-5.4", "claude-sonnet-4-6"
+    provider: str  # "OpenAI API", "Mistral API", "Groq API", etc.
+    model_name: str  # bare name e.g. "gpt-5.4", "llama-3.3-70b-versatile"
     api_key: str  # BYOK key, passed per-call
     api_base: str | None = None  # For LM Studio custom endpoints
     timeout: int | None = None  # Request timeout in seconds
-    use_thinking: bool = False  # Anthropic extended thinking
     max_tokens: int | None = None  # Override default max tokens
     response_format: str | dict = "text"  # "text", "json", or a JSON schema dict
 
@@ -35,7 +34,7 @@ class LLMResponse:
     """Normalized response from any LLM provider."""
 
     content: str  # The main text response
-    thinking: str | None = None  # Extended thinking (Anthropic/Google)
+    thinking: str | None = None  # Responses API reasoning summaries
     reasoning: str | None = None  # <think> tag reasoning (Groq/DeepSeek)
     model: str = ""  # Model that actually responded
     tool_calls: list[ToolCallResult] | None = None

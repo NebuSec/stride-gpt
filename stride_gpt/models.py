@@ -1,14 +1,10 @@
 """Unified model registry — single source of truth for providers and models.
 
-To add or update a model, edit the MODELS list below. No other files need to change.
-Last reviewed: 2026-04-17
-
 Provider model listing pages:
-  - Anthropic: https://docs.anthropic.com/en/docs/about-claude/models
   - OpenAI:    https://platform.openai.com/docs/models
-  - Google AI: https://ai.google.dev/gemini-api/docs/models
   - Mistral:   https://docs.mistral.ai/getting-started/models
   - Groq:      https://console.groq.com/docs/models
+  - DeepSeek:  https://api-docs.deepseek.com/quick_start/pricing
 """
 
 from __future__ import annotations
@@ -20,13 +16,17 @@ from dataclasses import dataclass
 class ProviderInfo:
     """Provider-level metadata (auth, routing, UI text)."""
 
-    name: str  # Display name: "OpenAI", "Anthropic", etc.
+    name: str  # Display name: "OpenAI", "Groq", etc.
     provider_key: str  # Routing key used in LLMConfig.provider
-    litellm_prefix: str  # Prefix for LiteLLM model routing
     env_var: str | None = None
     needs_api_key: bool = True
     needs_api_base: bool = False
     default_api_base: str | None = None
+    # OpenAI-compatible Chat Completions base. None → OpenAI default host.
+    chat_api_base: str | None = None
+    # True → native OpenAI Responses API. False → Chat Completions.
+    uses_responses: bool = False
+    cli_prefix: str = ""  # e.g. "groq/" for --worker-model groq/llama-...
     api_key_url: str = ""
     setup_instructions: str = ""
 
@@ -39,8 +39,7 @@ class ModelInfo:
     provider_key: str  # Must match a ProviderInfo.provider_key
     default_tokens: int = 64000
     max_tokens: int = 128000
-    uses_max_completion_tokens: bool = False  # OpenAI reasoning models
-    supports_thinking: bool = False  # Anthropic/Gemini extended thinking
+    uses_max_completion_tokens: bool = False  # GPT-5 series output cap
     supports_tools: bool = True
     help_text: str = ""
 
@@ -53,8 +52,9 @@ PROVIDERS: dict[str, ProviderInfo] = {
     "OpenAI": ProviderInfo(
         name="OpenAI",
         provider_key="OpenAI API",
-        litellm_prefix="",
         env_var="OPENAI_API_KEY",
+        uses_responses=True,
+        cli_prefix="openai/",
         api_key_url="https://platform.openai.com/account/api-keys",
         setup_instructions=(
             "1. Enter your [OpenAI API key](https://platform.openai.com/account/api-keys) "
@@ -63,37 +63,12 @@ PROVIDERS: dict[str, ProviderInfo] = {
             "3. Generate a threat list, attack tree and/or mitigating controls for your application 🚀"
         ),
     ),
-    "Anthropic": ProviderInfo(
-        name="Anthropic",
-        provider_key="Anthropic API",
-        litellm_prefix="anthropic/",
-        env_var="ANTHROPIC_API_KEY",
-        api_key_url="https://console.anthropic.com/settings/keys",
-        setup_instructions=(
-            "1. Enter your [Anthropic API key](https://console.anthropic.com/settings/keys) "
-            "and chosen model below 🔑\n"
-            "2. Provide details of the application that you would like to threat model  📝\n"
-            "3. Generate a threat list, attack tree and/or mitigating controls for your application 🚀"
-        ),
-    ),
-    "Google AI": ProviderInfo(
-        name="Google AI",
-        provider_key="Google AI API",
-        litellm_prefix="gemini/",
-        env_var="GOOGLE_API_KEY",
-        api_key_url="https://makersuite.google.com/app/apikey",
-        setup_instructions=(
-            "1. Enter your [Google AI API key](https://makersuite.google.com/app/apikey) "
-            "and chosen model below 🔑\n"
-            "2. Provide details of the application that you would like to threat model  📝\n"
-            "3. Generate a threat list, attack tree and/or mitigating controls for your application 🚀"
-        ),
-    ),
     "Mistral": ProviderInfo(
         name="Mistral",
         provider_key="Mistral API",
-        litellm_prefix="mistral/",
         env_var="MISTRAL_API_KEY",
+        chat_api_base="https://api.mistral.ai/v1",
+        cli_prefix="mistral/",
         api_key_url="https://console.mistral.ai/api-keys/",
         setup_instructions=(
             "1. Enter your [Mistral API key](https://console.mistral.ai/api-keys/) "
@@ -105,8 +80,9 @@ PROVIDERS: dict[str, ProviderInfo] = {
     "Groq": ProviderInfo(
         name="Groq",
         provider_key="Groq API",
-        litellm_prefix="groq/",
         env_var="GROQ_API_KEY",
+        chat_api_base="https://api.groq.com/openai/v1",
+        cli_prefix="groq/",
         api_key_url="https://console.groq.com/keys",
         setup_instructions=(
             "1. Enter your [Groq API key](https://console.groq.com/keys) "
@@ -118,8 +94,9 @@ PROVIDERS: dict[str, ProviderInfo] = {
     "DeepSeek": ProviderInfo(
         name="DeepSeek",
         provider_key="DeepSeek API",
-        litellm_prefix="deepseek/",
         env_var="DEEPSEEK_API_KEY",
+        chat_api_base="https://api.deepseek.com",
+        cli_prefix="deepseek/",
         api_key_url="https://platform.deepseek.com/api_keys",
         setup_instructions=(
             "1. Enter your [DeepSeek API key](https://platform.deepseek.com/api_keys) "
@@ -131,7 +108,6 @@ PROVIDERS: dict[str, ProviderInfo] = {
     "LM Studio": ProviderInfo(
         name="LM Studio",
         provider_key="LM Studio Server",
-        litellm_prefix="openai/",
         env_var=None,
         needs_api_key=False,
         needs_api_base=True,
@@ -191,71 +167,6 @@ MODELS: list[ModelInfo] = [
         max_tokens=400000,
         uses_max_completion_tokens=True,
         help_text="GPT-5.4 Nano is the fastest and most affordable option.",
-    ),
-    # --- Anthropic ---
-    ModelInfo(
-        model_id="claude-sonnet-4-6",
-        provider_key="Anthropic API",
-        default_tokens=64000,
-        max_tokens=200000,
-        supports_thinking=True,
-        help_text="Claude Sonnet 4.6 offers the best balance of performance and efficiency.",
-    ),
-    ModelInfo(
-        model_id="claude-opus-4-8",
-        provider_key="Anthropic API",
-        default_tokens=64000,
-        max_tokens=200000,
-        supports_thinking=True,
-        help_text="Claude Opus 4.8 is the most capable Claude model.",
-    ),
-    ModelInfo(
-        model_id="claude-opus-4-7",
-        provider_key="Anthropic API",
-        default_tokens=64000,
-        max_tokens=200000,
-        supports_thinking=True,
-        help_text="Claude Opus 4.7 is the previous-generation Opus, still available for users mid-engagement.",
-    ),
-    ModelInfo(
-        model_id="claude-haiku-4-5-20251001",
-        provider_key="Anthropic API",
-        default_tokens=64000,
-        max_tokens=200000,
-        help_text="Claude Haiku 4.5 is the fastest and most cost-effective Claude model.",
-    ),
-    # --- Google AI ---
-    ModelInfo(
-        model_id="gemini-3.1-pro-preview",
-        provider_key="Google AI API",
-        default_tokens=200000,
-        max_tokens=1000000,
-        supports_thinking=True,
-        help_text="Gemini 3.1 Pro is Google's most capable model with 1M context.",
-    ),
-    ModelInfo(
-        model_id="gemini-3.5-flash",
-        provider_key="Google AI API",
-        default_tokens=200000,
-        max_tokens=1000000,
-        supports_thinking=True,
-        help_text="Gemini 3.5 Flash is Google's latest fast model with 1M context.",
-    ),
-    ModelInfo(
-        model_id="gemini-3.1-flash-lite",
-        provider_key="Google AI API",
-        default_tokens=200000,
-        max_tokens=1000000,
-        supports_thinking=True,
-        help_text="Gemini 3.1 Flash Lite is the most cost-efficient option with 1M context.",
-    ),
-    ModelInfo(
-        model_id="gemini-3-flash-preview",
-        provider_key="Google AI API",
-        default_tokens=200000,
-        max_tokens=1000000,
-        supports_thinking=True,
-        help_text="Gemini 3 Flash is optimized for speed with 1M context.",
     ),
     # --- Mistral ---
     ModelInfo(
@@ -350,9 +261,6 @@ _MODEL_LOOKUP: dict[tuple[str, str], ModelInfo] = {
 _COMPLETION_TOKEN_IDS: set[str] = {
     m.model_id for m in MODELS if m.uses_max_completion_tokens
 }
-_THINKING_LOOKUP: set[tuple[str, str]] = {
-    (m.provider_key, m.model_id) for m in MODELS if m.supports_thinking
-}
 
 
 # ---------------------------------------------------------------------------
@@ -375,17 +283,12 @@ def get_provider_by_key(provider_key: str) -> ProviderInfo | None:
     return _PROVIDER_BY_KEY.get(provider_key)
 
 
-def get_litellm_prefix(provider_key: str) -> str:
-    """Return the LiteLLM model prefix for a provider key."""
+def provider_uses_responses(provider_key: str) -> bool:
+    """True if this provider speaks the OpenAI Responses API."""
     provider = _PROVIDER_BY_KEY.get(provider_key)
-    return provider.litellm_prefix if provider else ""
+    return bool(provider and provider.uses_responses)
 
 
 def model_uses_completion_tokens(model_id: str) -> bool:
-    """True if this model uses max_completion_tokens instead of max_tokens."""
+    """True if this model uses max_completion_tokens / max_output_tokens."""
     return model_id in _COMPLETION_TOKEN_IDS
-
-
-def model_supports_thinking(provider_key: str, model_id: str) -> bool:
-    """True if this model supports extended thinking / reasoning mode."""
-    return (provider_key, model_id) in _THINKING_LOOKUP

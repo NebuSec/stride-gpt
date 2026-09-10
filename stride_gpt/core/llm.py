@@ -1,20 +1,23 @@
-"""Unified LLM interface. All providers routed through LiteLLM."""
+"""Unified LLM interface.
+
+OpenAI uses the native Responses API. Groq, DeepSeek, Mistral, and LM Studio
+use the OpenAI SDK against Chat Completions-compatible endpoints.
+"""
 
 from __future__ import annotations
 
 import json as _json
 import re
 
-import litellm
+from openai import OpenAI
 
 from stride_gpt.core.mermaid_utils import extract_mermaid_code
 from stride_gpt.core.schemas import LLMConfig, LLMResponse, ToolCallResult
 from stride_gpt.models import (
-    get_litellm_prefix,
     get_model,
     get_provider_by_key,
-    model_supports_thinking,
     model_uses_completion_tokens,
+    provider_uses_responses,
 )
 
 # Local OpenAI-compatible servers (LM Studio) ignore the key, but the OpenAI SDK
@@ -31,28 +34,21 @@ def _default_output_tokens(config: LLMConfig, fallback: int) -> int:
         return registered.default_tokens
     return fallback
 
-# Suppress LiteLLM's verbose logging
-litellm.suppress_debug_info = True
-
-# Gemini safety settings — allow security-related content generation
-GEMINI_SAFETY_SETTINGS = [
-    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-]
-
 
 def call_llm(config: LLMConfig, messages: list[dict]) -> LLMResponse:
     """Call an LLM with the given messages."""
-    return _call_litellm(config, messages)
+    if provider_uses_responses(config.provider):
+        return _call_responses(config, messages)
+    return _call_chat_completions(config, messages)
 
 
 def call_llm_with_tools(
     config: LLMConfig, messages: list[dict], tools: list[dict]
 ) -> LLMResponse:
     """Call an LLM with tool definitions. Returns response with optional tool_calls."""
-    return _call_litellm_with_tools(config, messages, tools)
+    if provider_uses_responses(config.provider):
+        return _call_responses(config, messages, tools=tools)
+    return _call_chat_completions(config, messages, tools=tools)
 
 
 def call_llm_with_image(
@@ -62,187 +58,334 @@ def call_llm_with_image(
     media_type: str = "image/jpeg",
 ) -> LLMResponse:
     """Call an LLM with an image for analysis."""
-    return _call_litellm_with_image(config, prompt, base64_image, media_type)
+    messages = _image_messages(config, prompt, base64_image, media_type)
+    if provider_uses_responses(config.provider):
+        return _call_responses(config, messages)
+    return _call_chat_completions(config, messages)
 
 
 # ---------------------------------------------------------------------------
-# LiteLLM path (all providers)
+# Client construction
 # ---------------------------------------------------------------------------
 
 
-def _build_litellm_kwargs(config: LLMConfig) -> dict:
-    """Build kwargs dict for litellm.completion() from config."""
-    prefix = get_litellm_prefix(config.provider)
-    model = prefix + config.model_name
-
+def _client_kwargs(config: LLMConfig) -> dict:
+    """Kwargs for OpenAI() — api_key, base_url, retries, timeout."""
     provider_info = get_provider_by_key(config.provider)
     api_key = config.api_key or None
     if api_key is None and provider_info is not None and not provider_info.needs_api_key:
         api_key = LOCAL_PLACEHOLDER_API_KEY
 
     kwargs: dict = {
-        "model": model,
         "api_key": api_key,
-        # Retry transient errors (429 rate limits, timeouts, 5xx). LiteLLM delegates
-        # to the provider SDK, which uses exponential backoff and respects the
-        # Retry-After header. Necessary because the agent loop bursts many calls
-        # in close succession and easily trips TPM caps on tight org tiers.
-        "num_retries": 3,
+        "max_retries": 3,
     }
+    if config.timeout:
+        kwargs["timeout"] = config.timeout
 
-    # Custom endpoint for LM Studio
-    if config.api_base:
-        if config.provider == "LM Studio Server":
-            kwargs["api_base"] = f"{config.api_base}/v1"
-        else:
-            kwargs["api_base"] = config.api_base
-
-    # JSON mode
-    if isinstance(config.response_format, dict):
-        # Caller provided an explicit JSON schema — use json_schema mode.
-        kwargs["response_format"] = {
-            "type": "json_schema",
-            "json_schema": {"name": "response", "schema": config.response_format},
-        }
-    elif config.response_format == "json" and config.provider != "LM Studio Server":
-        # Generic JSON mode — use json_object where supported.
-        # LM Studio only accepts json_schema or text.
-        kwargs["response_format"] = {"type": "json_object"}
-
-    # --- Google AI API specifics ---
-    if config.provider == "Google AI API":
-        kwargs["safety_settings"] = GEMINI_SAFETY_SETTINGS
-        # Gemini thinking-capable models have thinking enabled by default and
-        # surface it via `thinking_blocks` on the response — no explicit
-        # opt-in kwarg is required. Don't send Anthropic's
-        # `thinking={"type": "enabled", ...}` shape here; litellm's Gemini
-        # provider rejects it for newer models (e.g. gemini-3.1-flash-lite).
-
-    # --- Anthropic ---
-    elif config.provider == "Anthropic API" and config.use_thinking:
-        kwargs["thinking"] = {"type": "enabled", "budget_tokens": 16000}
-        # max_tokens must exceed budget_tokens; never go below 48000 here.
-        kwargs["max_tokens"] = max(_default_output_tokens(config, 48000), 48000)
-        kwargs["timeout"] = config.timeout or 600
-    elif config.provider == "Anthropic API":
-        kwargs["max_tokens"] = _default_output_tokens(config, 32768)
-        kwargs["timeout"] = config.timeout or 300
-
-    # GPT-5 series: max_completion_tokens instead of max_tokens
-    elif model_uses_completion_tokens(config.model_name):
-        kwargs["max_completion_tokens"] = _default_output_tokens(config, 20000)
-
-    # LM Studio: conservative default
-    elif config.provider == "LM Studio Server":
-        kwargs["max_tokens"] = config.max_tokens or 8000
-
-    # Groq / Mistral: original code never set max_tokens — let the API decide
-    elif config.provider in ("Groq API", "Mistral API"):
-        if config.max_tokens:
-            kwargs["max_tokens"] = config.max_tokens
-
-    # Other providers: only set if explicitly provided
-    elif config.max_tokens:
-        kwargs["max_tokens"] = config.max_tokens
-
+    base_url = _base_url(config)
+    if base_url:
+        kwargs["base_url"] = base_url
     return kwargs
 
 
-def _extract_thinking(config: LLMConfig, response) -> tuple[str | None, str | None]:
-    """Extract thinking/reasoning content from a response based on provider."""
-    thinking = None
-    reasoning = None
-
-    if config.provider == "Anthropic API" and config.use_thinking:
-        thinking = _extract_anthropic_thinking(response)
-    elif config.provider == "Google AI API" and model_supports_thinking(config.provider, config.model_name):
-        thinking = _extract_gemini_thinking(response)
-    elif config.provider == "Groq API":
-        # Groq/DeepSeek reasoning is extracted from content, handled separately
-        pass
-
-    return thinking, reasoning
+def _base_url(config: LLMConfig) -> str | None:
+    """Resolve the OpenAI-SDK base_url, or None for the default OpenAI host."""
+    if config.api_base:
+        base = config.api_base.rstrip("/")
+        if config.provider == "LM Studio Server" and not base.endswith("/v1"):
+            return f"{base}/v1"
+        return base
+    provider_info = get_provider_by_key(config.provider)
+    if provider_info is not None and provider_info.chat_api_base:
+        return provider_info.chat_api_base
+    return None
 
 
-def _extract_anthropic_thinking(response) -> str | None:
-    """Extract thinking content from an Anthropic response via LiteLLM."""
-    thinking_parts: list[str] = []
-    choices = getattr(response, "choices", [])
-    if choices:
-        message = choices[0].message
-        thinking_blocks = getattr(message, "thinking_blocks", None)
-        if thinking_blocks:
-            thinking_parts.extend(
-                block.thinking for block in thinking_blocks if hasattr(block, "thinking")
+def _openai_client(config: LLMConfig) -> OpenAI:
+    return OpenAI(**_client_kwargs(config))
+
+
+# ---------------------------------------------------------------------------
+# JSON / token kwargs shared by both transports
+# ---------------------------------------------------------------------------
+
+
+def _json_response_format(config: LLMConfig) -> dict | None:
+    """Chat Completions `response_format` payload, or None to omit."""
+    if isinstance(config.response_format, dict):
+        return {
+            "type": "json_schema",
+            "json_schema": {"name": "response", "schema": config.response_format},
+        }
+    if config.response_format == "json" and config.provider != "LM Studio Server":
+        # LM Studio only accepts json_schema or text.
+        return {"type": "json_object"}
+    return None
+
+
+def _responses_text_format(config: LLMConfig) -> dict | None:
+    """Responses API `text.format` payload, or None to omit."""
+    if isinstance(config.response_format, dict):
+        return {
+            "format": {
+                "type": "json_schema",
+                "name": "response",
+                "schema": config.response_format,
+            }
+        }
+    if config.response_format == "json":
+        return {"format": {"type": "json_object"}}
+    return None
+
+
+def _chat_token_kwargs(config: LLMConfig) -> dict:
+    """max_tokens / max_completion_tokens for Chat Completions."""
+    if model_uses_completion_tokens(config.model_name):
+        return {"max_completion_tokens": _default_output_tokens(config, 20000)}
+    if config.provider == "LM Studio Server":
+        return {"max_tokens": config.max_tokens or 8000}
+    # Groq / Mistral / DeepSeek: only set if the caller asked.
+    if config.max_tokens:
+        return {"max_tokens": config.max_tokens}
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# Responses API (OpenAI)
+# ---------------------------------------------------------------------------
+
+
+def _to_responses_tools(tools: list[dict]) -> list[dict]:
+    """Chat Completions nested tools → Responses flat function tools."""
+    converted: list[dict] = []
+    for tool in tools:
+        fn = tool.get("function") if tool.get("type") == "function" else None
+        if isinstance(fn, dict):
+            converted.append(
+                {
+                    "type": "function",
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+                }
             )
-    return "\n\n".join(thinking_parts) if thinking_parts else None
+        else:
+            converted.append(tool)
+    return converted
 
 
-def _extract_gemini_thinking(response) -> str | None:
-    """Extract thinking content from a Gemini response via LiteLLM."""
-    # LiteLLM exposes Gemini thinking as thought parts in the response
-    thinking_parts: list[str] = []
-    choices = getattr(response, "choices", [])
-    if choices:
-        message = choices[0].message
-        # LiteLLM may include thinking in provider_specific_fields or similar
-        thinking_blocks = getattr(message, "thinking_blocks", None)
-        if thinking_blocks:
-            thinking_parts.extend(
-                block.thinking for block in thinking_blocks if hasattr(block, "thinking")
+def _convert_content_parts(content: object) -> object:
+    """Chat Completions content parts → Responses input_text / input_image."""
+    if not isinstance(content, list):
+        return content
+    converted: list = []
+    for part in content:
+        if not isinstance(part, dict):
+            converted.append(part)
+            continue
+        ptype = part.get("type")
+        if ptype == "text":
+            converted.append({"type": "input_text", "text": part.get("text", "")})
+        elif ptype == "image_url":
+            image = part.get("image_url")
+            url = image.get("url") if isinstance(image, dict) else image
+            converted.append({"type": "input_image", "image_url": url})
+        else:
+            converted.append(part)
+    return converted
+
+
+def messages_to_responses_input(messages: list[dict]) -> tuple[str | None, list[dict]]:
+    """Split Chat Completions-shaped messages into (instructions, input items).
+
+    Agent loops keep the Chat Completions history format; this is the Responses
+    boundary. System messages become `instructions`. Tool results become
+    `function_call_output` items.
+    """
+    instructions_parts: list[str] = []
+    items: list[dict] = []
+
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+
+        if role == "system":
+            if isinstance(content, str) and content:
+                instructions_parts.append(content)
+            continue
+
+        if role == "tool":
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": msg.get("tool_call_id") or "",
+                    "output": content if isinstance(content, str) else _json.dumps(content),
+                }
             )
-        # Also check for thought in provider-specific response data
-        provider_specific = getattr(message, "provider_specific_fields", None)
-        if provider_specific and "thinking" in provider_specific:
-            thinking_parts.append(str(provider_specific["thinking"]))
-    return "\n\n".join(thinking_parts) if thinking_parts else None
+            continue
+
+        if role == "assistant" and msg.get("tool_calls"):
+            if isinstance(content, str) and content:
+                items.append({"role": "assistant", "content": content})
+            for tc in msg["tool_calls"]:
+                fn = tc.get("function") or {}
+                arguments = fn.get("arguments") or "{}"
+                if not isinstance(arguments, str):
+                    arguments = _json.dumps(arguments)
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": tc.get("id") or tc.get("call_id") or "",
+                        "name": fn.get("name") or "",
+                        "arguments": arguments,
+                    }
+                )
+            continue
+
+        item: dict = {"role": role or "user", "content": _convert_content_parts(content)}
+        items.append(item)
+
+    instructions = "\n\n".join(instructions_parts) or None
+    return instructions, items
 
 
-def _call_litellm(config: LLMConfig, messages: list[dict]) -> LLMResponse:
-    """Call LLM via LiteLLM (all providers)."""
-    kwargs = _build_litellm_kwargs(config)
-    response = litellm.completion(messages=messages, **kwargs)
+def _responses_call_kwargs(
+    config: LLMConfig,
+    messages: list[dict],
+    tools: list[dict] | None = None,
+) -> dict:
+    """Kwargs for client.responses.create()."""
+    instructions, input_items = messages_to_responses_input(messages)
+    kwargs: dict = {
+        "model": config.model_name,
+        "input": input_items,
+        "store": False,
+        "max_output_tokens": _default_output_tokens(config, 20000),
+    }
+    if instructions:
+        kwargs["instructions"] = instructions
+    if tools:
+        kwargs["tools"] = _to_responses_tools(tools)
+    else:
+        text_format = _responses_text_format(config)
+        if text_format is not None:
+            kwargs["text"] = text_format
+    return kwargs
+
+
+def _responses_text(response) -> str:
+    text = getattr(response, "output_text", None)
+    if text:
+        return text
+    parts: list[str] = []
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        for block in getattr(item, "content", None) or []:
+            value = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
+            if value:
+                parts.append(value)
+    return "".join(parts)
+
+
+def _responses_tool_calls(response) -> list[ToolCallResult] | None:
+    results: list[ToolCallResult] = []
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) != "function_call":
+            continue
+        raw_args = getattr(item, "arguments", None) or "{}"
+        parsed = _json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        results.append(
+            ToolCallResult(
+                id=getattr(item, "call_id", None) or getattr(item, "id", "") or "",
+                function_name=getattr(item, "name", "") or "",
+                arguments=parsed if isinstance(parsed, dict) else {},
+            )
+        )
+    return results or None
+
+
+def _responses_thinking(response) -> str | None:
+    parts: list[str] = []
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) != "reasoning":
+            continue
+        for block in getattr(item, "summary", None) or []:
+            value = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
+            if value:
+                parts.append(value)
+    return "\n\n".join(parts) if parts else None
+
+
+def _call_responses(
+    config: LLMConfig,
+    messages: list[dict],
+    tools: list[dict] | None = None,
+) -> LLMResponse:
+    """Call OpenAI via the Responses API."""
+    client = _openai_client(config)
+    kwargs = _responses_call_kwargs(config, messages, tools)
+    response = client.responses.create(**kwargs)
+
+    content = _responses_text(response)
+    tool_calls = _responses_tool_calls(response) if tools else None
+    thinking = _responses_thinking(response)
+
+    return LLMResponse(
+        content=content,
+        thinking=thinking,
+        model=config.model_name,
+        tool_calls=tool_calls,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chat Completions (OpenAI-compatible endpoints)
+# ---------------------------------------------------------------------------
+
+
+def _chat_call_kwargs(
+    config: LLMConfig,
+    messages: list[dict],
+    tools: list[dict] | None = None,
+) -> dict:
+    kwargs: dict = {
+        "model": config.model_name,
+        "messages": messages,
+        **_chat_token_kwargs(config),
+    }
+    if tools:
+        kwargs["tools"] = tools
+    else:
+        response_format = _json_response_format(config)
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+    return kwargs
+
+
+def _call_chat_completions(
+    config: LLMConfig,
+    messages: list[dict],
+    tools: list[dict] | None = None,
+) -> LLMResponse:
+    """Call an OpenAI-compatible Chat Completions endpoint."""
+    client = _openai_client(config)
+    kwargs = _chat_call_kwargs(config, messages, tools)
+    response = client.chat.completions.create(**kwargs)
 
     message = response.choices[0].message
     content = message.content or ""
 
-    # Some reasoning models (e.g. qwen3 via LM Studio) emit the full structured
-    # output into `reasoning_content` and leave `content` empty. When that
-    # happens, treat the reasoning text as the answer — providers with genuine
-    # thinking + answer separation (Anthropic, Google) populate content
-    # normally, so this fallback only triggers when there's nothing else to use.
+    # Some local reasoning models emit the structured output into
+    # `reasoning_content` and leave `content` empty.
     if not content.strip():
         fallback = getattr(message, "reasoning_content", None)
         if fallback:
             content = fallback
 
-    thinking, reasoning = _extract_thinking(config, response)
-
-    if config.provider == "Groq API":
-        reasoning, content = extract_deepseek_reasoning(content)
-
-    return LLMResponse(
-        content=content,
-        thinking=thinking,
-        reasoning=reasoning,
-        model=config.model_name,
-    )
-
-
-def _call_litellm_with_tools(
-    config: LLMConfig, messages: list[dict], tools: list[dict]
-) -> LLMResponse:
-    """Call LLM with tool definitions via LiteLLM."""
-    kwargs = _build_litellm_kwargs(config)
-    # Don't send JSON response_format when using tools — the model decides the format
-    kwargs.pop("response_format", None)
-    response = litellm.completion(messages=messages, tools=tools, **kwargs)
-
-    message = response.choices[0].message
-    content = message.content or ""
-
     tool_calls = None
-    if message.tool_calls:
+    if tools and getattr(message, "tool_calls", None):
         tool_calls = [
             ToolCallResult(
                 id=tc.id,
@@ -254,26 +397,25 @@ def _call_litellm_with_tools(
             for tc in message.tool_calls
         ]
 
-    thinking, _ = _extract_thinking(config, response)
+    reasoning = None
+    if config.provider == "Groq API":
+        reasoning, content = extract_deepseek_reasoning(content)
 
     return LLMResponse(
         content=content,
-        thinking=thinking,
+        reasoning=reasoning,
         model=config.model_name,
         tool_calls=tool_calls,
     )
 
 
-def _call_litellm_with_image(
+def _image_messages(
     config: LLMConfig,
     prompt: str,
     base64_image: str,
     media_type: str,
-) -> LLMResponse:
-    """Call LLM with an image via LiteLLM multimodal support."""
-    kwargs = _build_litellm_kwargs(config)
-    # Build multimodal message
-    messages = [
+) -> list[dict]:
+    messages: list[dict] = [
         {
             "role": "user",
             "content": [
@@ -285,8 +427,6 @@ def _call_litellm_with_image(
             ],
         }
     ]
-
-    # For reasoning models, add system message
     if model_uses_completion_tokens(config.model_name):
         from stride_gpt.core.prompts import create_reasoning_system_prompt
 
@@ -303,11 +443,7 @@ def _call_litellm_with_image(
    - Security Considerations: Note any visible security measures""",
         )
         messages.insert(0, {"role": "system", "content": system_prompt})
-
-    response = litellm.completion(messages=messages, **kwargs)
-    content = response.choices[0].message.content or ""
-    thinking, _ = _extract_thinking(config, response)
-    return LLMResponse(content=content, thinking=thinking, model=config.model_name)
+    return messages
 
 
 # ---------------------------------------------------------------------------
