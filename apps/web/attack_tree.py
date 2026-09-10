@@ -454,20 +454,6 @@ def get_attack_tree_deepseek(deepseek_api_key, deepseek_model, prompt):
     return mermaid
 
 
-# Function to get attack tree from Anthropic's Claude model.
-def get_attack_tree_anthropic(anthropic_api_key, anthropic_model, prompt):
-    config = LLMConfig(
-        provider="Anthropic API",
-        model_name=anthropic_model,
-        api_key=anthropic_api_key,
-        use_thinking=st.session_state.get("use_thinking", False),
-    )
-    mermaid, response = generate_attack_tree(config, prompt)
-    if response.thinking:
-        st.session_state["last_thinking_content"] = response.thinking
-    return mermaid
-
-
 # Function to get attack tree from LM Studio Server response.
 def get_attack_tree_lm_studio(lm_studio_endpoint, model_name, prompt, api_key="not-needed"):
     config = LLMConfig(
@@ -489,11 +475,3 @@ def get_attack_tree_groq(groq_api_key, groq_model, prompt):
             st.write(response.reasoning)
     return mermaid
 
-
-# Function to get attack tree from the Google model's response.
-def get_attack_tree_google(google_api_key, google_model, prompt):
-    config = LLMConfig(provider="Google AI API", model_name=google_model, api_key=google_api_key)
-    mermaid, response = generate_attack_tree(config, prompt)
-    if response.thinking:
-        st.session_state["last_thinking_content"] = response.thinking
-    return mermaid

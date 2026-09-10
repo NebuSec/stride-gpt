@@ -14,12 +14,8 @@ __all__ = [
     "create_llm_stride_prompt_section",
     "create_threat_model_prompt",
     "get_image_analysis",
-    "get_image_analysis_anthropic",
-    "get_image_analysis_google",
     "get_threat_model",
-    "get_threat_model_anthropic",
     "get_threat_model_deepseek",
-    "get_threat_model_google",
     "get_threat_model_groq",
     "get_threat_model_lm_studio",
     "get_threat_model_mistral",
@@ -119,35 +115,10 @@ def get_image_analysis(api_key, model_name, prompt, base64_image):
     return {"choices": [{"message": {"content": response.content}}]}
 
 
-# Function to get image analysis using Google Gemini models
-def get_image_analysis_google(api_key, model_name, prompt, base64_image):
-    config = LLMConfig(provider="Google AI API", model_name=model_name, api_key=api_key)
-    response = analyze_image(config, base64_image)
-    return {"choices": [{"message": {"content": response.content}}]}
-
-
-# Function to get image analysis using Anthropic Claude models
-def get_image_analysis_anthropic(
-    api_key, model_name, prompt, base64_image, media_type="image/jpeg"
-):
-    config = LLMConfig(provider="Anthropic API", model_name=model_name, api_key=api_key)
-    response = analyze_image(config, base64_image, media_type=media_type)
-    return {"choices": [{"message": {"content": response.content}}]}
-
-
 # Function to get threat model from the GPT response.
 def get_threat_model(api_key, model_name, prompt):
     config = LLMConfig(provider="OpenAI API", model_name=model_name, api_key=api_key)
     result, _response = generate_threat_model(config, prompt)
-    return {"threat_model": result.threat_model, "improvement_suggestions": result.improvement_suggestions}
-
-
-# Function to get threat model from the Google response.
-def get_threat_model_google(google_api_key, google_model, prompt):
-    config = LLMConfig(provider="Google AI API", model_name=google_model, api_key=google_api_key)
-    result, response = generate_threat_model(config, prompt)
-    if response.thinking:
-        st.session_state["last_thinking_content"] = response.thinking
     return {"threat_model": result.threat_model, "improvement_suggestions": result.improvement_suggestions}
 
 
@@ -162,20 +133,6 @@ def get_threat_model_mistral(mistral_api_key, mistral_model, prompt):
 def get_threat_model_deepseek(deepseek_api_key, deepseek_model, prompt):
     config = LLMConfig(provider="DeepSeek API", model_name=deepseek_model, api_key=deepseek_api_key)
     result, _response = generate_threat_model(config, prompt)
-    return {"threat_model": result.threat_model, "improvement_suggestions": result.improvement_suggestions}
-
-
-# Function to get threat model from the Claude response.
-def get_threat_model_anthropic(anthropic_api_key, anthropic_model, prompt):
-    config = LLMConfig(
-        provider="Anthropic API",
-        model_name=anthropic_model,
-        api_key=anthropic_api_key,
-        use_thinking=st.session_state.get("use_thinking", False),
-    )
-    result, response = generate_threat_model(config, prompt)
-    if response.thinking:
-        st.session_state["last_thinking_content"] = response.thinking
     return {"threat_model": result.threat_model, "improvement_suggestions": result.improvement_suggestions}
 
 

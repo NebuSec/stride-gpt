@@ -23,21 +23,15 @@ import tiktoken
 from attack_tree import (
     create_attack_tree_prompt,
     get_attack_tree,
-    get_attack_tree_anthropic,
     get_attack_tree_deepseek,
-    get_attack_tree_google,
     get_attack_tree_groq,
     get_attack_tree_lm_studio,
     get_attack_tree_mistral,
 )
 from components.drawio_editor import drawio_editor_component
 from dfd import (
-    get_dfd_anthropic,
     get_dfd_deepseek,
-    get_dfd_from_image_anthropic,
-    get_dfd_from_image_google,
     get_dfd_from_image_openai,
-    get_dfd_google,
     get_dfd_groq,
     get_dfd_lm_studio,
     get_dfd_mistral,
@@ -48,9 +42,7 @@ from dread import (
     create_dread_assessment_prompt,
     dread_json_to_markdown,
     get_dread_assessment,
-    get_dread_assessment_anthropic,
     get_dread_assessment_deepseek,
-    get_dread_assessment_google,
     get_dread_assessment_groq,
     get_dread_assessment_lm_studio,
     get_dread_assessment_mistral,
@@ -59,9 +51,7 @@ from github import Github, GithubException
 from mitigations import (
     create_mitigations_prompt,
     get_mitigations,
-    get_mitigations_anthropic,
     get_mitigations_deepseek,
-    get_mitigations_google,
     get_mitigations_groq,
     get_mitigations_lm_studio,
     get_mitigations_mistral,
@@ -71,9 +61,7 @@ from provider_keys import PROVIDER_API_KEY_STATE
 from test_cases import (
     create_test_cases_prompt,
     get_test_cases,
-    get_test_cases_anthropic,
     get_test_cases_deepseek,
-    get_test_cases_google,
     get_test_cases_groq,
     get_test_cases_lm_studio,
     get_test_cases_mistral,
@@ -82,12 +70,8 @@ from threat_model import (
     create_image_analysis_prompt,
     create_threat_model_prompt,
     get_image_analysis,
-    get_image_analysis_anthropic,
-    get_image_analysis_google,
     get_threat_model,
-    get_threat_model_anthropic,
     get_threat_model_deepseek,
-    get_threat_model_google,
     get_threat_model_groq,
     get_threat_model_lm_studio,
     get_threat_model_mistral,
@@ -874,14 +858,6 @@ def load_env_variables():
     if openai_api_key:
         st.session_state["openai_api_key"] = openai_api_key
 
-    anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
-    if anthropic_api_key:
-        st.session_state["anthropic_api_key"] = anthropic_api_key
-
-    google_api_key = os.getenv("GOOGLE_API_KEY")
-    if google_api_key:
-        st.session_state["google_api_key"] = google_api_key
-
     mistral_api_key = os.getenv("MISTRAL_API_KEY")
     if mistral_api_key:
         st.session_state["mistral_api_key"] = mistral_api_key
@@ -1042,17 +1018,6 @@ with st.sidebar:
             help=_model_help or None,
         )
 
-        # Anthropic-specific: Extended Thinking checkbox
-        if model_provider == "Anthropic API":
-            # Not assigned: `key` writes to st.session_state, which is where
-            # the value is read back from further down.
-            st.checkbox(
-                "Enable Extended Thinking",
-                value=st.session_state.get("use_thinking", False),
-                key="use_thinking",
-                help="Extended thinking gives Claude enhanced reasoning capabilities for complex tasks. This may increase response time and token usage.",
-            )
-
     # Add GitHub API key input field to the sidebar
     github_api_key = st.text_input(
         "Enter your GitHub API key (optional):",
@@ -1154,7 +1119,7 @@ with st.sidebar:
     st.markdown(
         """
     ### **How does STRIDE GPT work?**
-    When you enter an application description and other relevant details, the tool uses advanced AI models from multiple providers (OpenAI, Anthropic, Google, Mistral, LM Studio, and Groq) to generate a threat model for your application. The selected model analyzes the application description and details to generate a list of potential threats and then categorises each threat according to the STRIDE methodology.
+    When you enter an application description and other relevant details, the tool uses advanced AI models from multiple providers (OpenAI, Mistral, Groq, DeepSeek, and LM Studio) to generate a threat model for your application. The selected model analyzes the application description and details to generate a list of potential threats and then categorises each threat according to the STRIDE methodology.
     """
     )
     st.markdown(
@@ -1172,10 +1137,7 @@ with st.sidebar:
 
     **Reasoning Models:** If you've selected a GPT-5 series model, these models take longer because they "think" before responding to provide more thorough analysis.
 
-    **For Faster Results:** Choose smaller/faster models like:
-    - Gemini Flash instead of Gemini Pro
-    - GPT-5-nano instead of GPT-5.2
-    - Claude Haiku instead of Claude Sonnet
+    **For Faster Results:** Choose smaller/faster models like GPT-5-nano instead of GPT-5.2.
     """
     )
     st.markdown(
@@ -1196,14 +1158,12 @@ with st.sidebar:
 #
 # `load_env_variables()` reads .env into FUNCTION-LOCAL variables, and the
 # sidebar's password fields only write to st.session_state — neither path
-# defines `openai_api_key` / `anthropic_api_key` / etc. at module scope.
+# defines `openai_api_key` / `mistral_api_key` / etc. at module scope.
 # Hoist them here, after the sidebar has run, so the bare names referenced
 # throughout the tab bodies (image analysis, threat model, attack tree,
 # mitigations, DREAD, test cases) resolve to the live values. Streamlit's
 # hot-reload was masking this by leaking stale locals across reruns.
 openai_api_key = st.session_state.get("openai_api_key", "")
-anthropic_api_key = st.session_state.get("anthropic_api_key", "")
-google_api_key = st.session_state.get("google_api_key", "")
 mistral_api_key = st.session_state.get("mistral_api_key", "")
 groq_api_key = st.session_state.get("groq_api_key", "")
 deepseek_api_key = st.session_state.get("deepseek_api_key", "")
@@ -1272,13 +1232,8 @@ understanding possible vulnerabilities and attack vectors. Use this tab to gener
         # Get selected_model from session state
         selected_model = st.session_state.get("selected_model", "")
 
-        if (
-            (
-                model_provider == "OpenAI API"
-                and (selected_model.startswith("gpt-4") or selected_model.startswith("gpt-5"))
-            )
-            or model_provider == "Google AI API"
-            or (model_provider == "Anthropic API" and selected_model.startswith("claude-"))
+        if model_provider == "OpenAI API" and (
+            selected_model.startswith("gpt-4") or selected_model.startswith("gpt-5")
         ):
             supports_image = True
 
@@ -1304,8 +1259,8 @@ understanding possible vulnerabilities and attack vectors. Use this tab to gener
         with _img_tab:
             if not supports_image:
                 st.info(
-                    "Image upload needs a vision-capable model (OpenAI, Google AI, "
-                    "or an Anthropic Claude model). Switch model in the sidebar, or "
+                    "Image upload needs a vision-capable OpenAI model (gpt-4* / gpt-5*). "
+                    "Switch model in the sidebar, or "
                     "use the **Draw diagram** or **Guided** tab, which work with "
                     "any model."
                 )
@@ -1322,43 +1277,13 @@ understanding possible vulnerabilities and attack vectors. Use this tab to gener
                     base64_image = encode_image(uploaded_file)
                     image_analysis_prompt = create_image_analysis_prompt()
 
-                    # Determine media type from file extension
-                    file_type = uploaded_file.type
-                    if file_type == "image/png":
-                        media_type = "image/png"
-                    elif file_type in ["image/jpeg", "image/jpg"]:
-                        media_type = "image/jpeg"
-                    else:
-                        media_type = "image/jpeg"  # Default fallback
-
                     try:
-                        if model_provider == "OpenAI API":
-                            if not openai_api_key:
-                                st.error("Please enter your OpenAI API key to analyse the image.")
-                                raise ValueError
-                            image_analysis_output = get_image_analysis(
-                                openai_api_key, selected_model, image_analysis_prompt, base64_image
-                            )
-                        elif model_provider == "Google AI API":
-                            if not google_api_key:
-                                st.error("Please enter your Google AI API key to analyse the image.")
-                                raise ValueError
-                            image_analysis_output = get_image_analysis_google(
-                                google_api_key, selected_model, image_analysis_prompt, base64_image
-                            )
-                        elif model_provider == "Anthropic API":
-                            if not anthropic_api_key:
-                                st.error("Please enter your Anthropic API key to analyse the image.")
-                                raise ValueError
-                            image_analysis_output = get_image_analysis_anthropic(
-                                anthropic_api_key,
-                                selected_model,
-                                image_analysis_prompt,
-                                base64_image,
-                                media_type,
-                            )
-                        else:
-                            image_analysis_output = None
+                        if not openai_api_key:
+                            st.error("Please enter your OpenAI API key to analyse the image.")
+                            raise ValueError
+                        image_analysis_output = get_image_analysis(
+                            openai_api_key, selected_model, image_analysis_prompt, base64_image
+                        )
 
                         if (
                             image_analysis_output
@@ -1503,10 +1428,6 @@ understanding possible vulnerabilities and attack vectors. Use this tab to gener
             confirmed_dfd=st.session_state.get("confirmed_dfd"),
         )
 
-        # Clear thinking content when switching models or starting a new operation
-        if model_provider != "Anthropic API" or "thinking" not in selected_model.lower():
-            st.session_state.pop("last_thinking_content", None)
-
         # Show a spinner while generating the threat model
         with st.spinner("Analysing potential threats..."):
             max_retries = 3
@@ -1518,30 +1439,10 @@ understanding possible vulnerabilities and attack vectors. Use this tab to gener
                         model_output = get_threat_model(
                             openai_api_key, selected_model, threat_model_prompt
                         )
-                    elif model_provider == "Google AI API":
-                        model_output = get_threat_model_google(
-                            google_api_key, selected_model, threat_model_prompt
-                        )
                     elif model_provider == "Mistral API":
                         model_output = get_threat_model_mistral(
                             mistral_api_key, selected_model, threat_model_prompt
                         )
-                    elif model_provider == "Anthropic API":
-                        model_output = get_threat_model_anthropic(
-                            anthropic_api_key, selected_model, threat_model_prompt
-                        )
-                        # Check if we got a fallback response
-                        if (
-                            model_output.get("threat_model")
-                            and len(model_output["threat_model"]) == 1
-                            and model_output["threat_model"][0].get("Threat Type") == "Error"
-                        ):
-                            st.warning(
-                                "⚠️ There was an issue generating the threat model. The model may have returned a response in an unexpected format. You can try:"
-                            )
-                            st.markdown("1. Running the generation again")
-                            st.markdown("2. Checking the application logs for more details")
-                            st.markdown("3. Using a different model if the issue persists")
                     elif model_provider == "LM Studio Server":
                         model_output = get_threat_model_lm_studio(
                             st.session_state["lm_studio_endpoint"],
@@ -1590,19 +1491,6 @@ with tab1:
 
     # Display threat model from session state (persists across reruns)
     if st.session_state.get("threat_model_markdown"):
-        # Display thinking content in an expander if available
-        if (
-            "last_thinking_content" in st.session_state
-            and st.session_state["last_thinking_content"]
-            and (
-                (model_provider == "Anthropic API" and st.session_state.get("use_thinking", False))
-                or (model_provider == "Google AI API" and ("gemini-2.5" in selected_model.lower() or "gemini-3" in selected_model.lower()))
-            )
-        ):
-            thinking_model = "Claude" if model_provider == "Anthropic API" else "Gemini"
-            with st.expander(f"View {thinking_model}'s thinking process"):
-                st.markdown(st.session_state["last_thinking_content"])
-
         # Display the threat model in Markdown
         st.markdown(st.session_state["threat_model_markdown"])
 
@@ -1655,10 +1543,6 @@ vulnerabilities and prioritising mitigation efforts.
                 confirmed_dfd=st.session_state.get("confirmed_dfd"),
             )
 
-            # Clear thinking content when switching models or starting a new operation
-            if model_provider != "Anthropic API" or "thinking" not in selected_model.lower():
-                st.session_state.pop("last_thinking_content", None)
-
             # Show a spinner while generating the attack tree
             with st.spinner("Generating attack tree..."):
                 try:
@@ -1667,17 +1551,9 @@ vulnerabilities and prioritising mitigation efforts.
                         mermaid_code = get_attack_tree(
                             openai_api_key, selected_model, attack_tree_prompt
                         )
-                    elif model_provider == "Google AI API":
-                        mermaid_code = get_attack_tree_google(
-                            google_api_key, selected_model, attack_tree_prompt
-                        )
                     elif model_provider == "Mistral API":
                         mermaid_code = get_attack_tree_mistral(
                             mistral_api_key, selected_model, attack_tree_prompt
-                        )
-                    elif model_provider == "Anthropic API":
-                        mermaid_code = get_attack_tree_anthropic(
-                            anthropic_api_key, selected_model, attack_tree_prompt
                         )
                     elif model_provider == "LM Studio Server":
                         mermaid_code = get_attack_tree_lm_studio(
@@ -1694,25 +1570,6 @@ vulnerabilities and prioritising mitigation efforts.
                         mermaid_code = get_attack_tree_deepseek(
                             deepseek_api_key, selected_model, attack_tree_prompt
                         )
-
-                    # Display thinking content in an expander if available
-                    if (
-                        "last_thinking_content" in st.session_state
-                        and st.session_state["last_thinking_content"]
-                        and (
-                            (
-                                model_provider == "Anthropic API"
-                                and "thinking" in selected_model.lower()
-                            )
-                            or (
-                                model_provider == "Google AI API"
-                                and ("gemini-2.5" in selected_model.lower() or "gemini-3" in selected_model.lower())
-                            )
-                        )
-                    ):
-                        thinking_model = "Claude" if model_provider == "Anthropic API" else "Gemini"
-                        with st.expander(f"View {thinking_model}'s thinking process"):
-                            st.markdown(st.session_state["last_thinking_content"])
 
                     # Display the generated attack tree code
                     st.write("Attack Tree Code:")
@@ -1790,13 +1647,10 @@ Three ways to use this tab:
 
     with dfd_input_col2:
         st.markdown("**Or parse an existing DFD image**")
-        # Vision support set is the same as for architecture diagrams.
+        # Vision support is OpenAI gpt-4 / gpt-5 only (same as architecture diagrams).
         dfd_vision_supported = (
-            (model_provider == "OpenAI API" and (
-                selected_model.startswith("gpt-4") or selected_model.startswith("gpt-5")
-            ))
-            or model_provider == "Google AI API"
-            or (model_provider == "Anthropic API" and selected_model.startswith("claude"))
+            model_provider == "OpenAI API"
+            and (selected_model.startswith("gpt-4") or selected_model.startswith("gpt-5"))
         )
         if dfd_vision_supported:
             uploaded_dfd_image = st.file_uploader(
@@ -1808,15 +1662,14 @@ Three ways to use this tab:
         else:
             uploaded_dfd_image = None
             st.caption(
-                "Image parsing requires a vision-capable model "
-                "(OpenAI GPT-4/5, Anthropic Claude, or Google Gemini)."
+                "Image parsing requires a vision-capable OpenAI model (GPT-4/5)."
             )
 
     # --- Section 2: Handle Generation --- #
 
     # API keys live in st.session_state once the sidebar has run (loaded from
     # .env in load_env_variables and/or typed into the password field). The
-    # bare names openai_api_key / anthropic_api_key etc. are only ever local
+    # bare names openai_api_key / mistral_api_key etc. are only ever local
     # to load_env_variables, so always go through session_state here.
     _dfd_api_key = st.session_state.get(
         PROVIDER_API_KEY_STATE.get(model_provider, ""),
@@ -1841,10 +1694,6 @@ Three ways to use this tab:
                 try:
                     if model_provider == "OpenAI API":
                         dfd_mermaid = get_dfd_openai(_dfd_api_key, selected_model, dfd_prompt)
-                    elif model_provider == "Anthropic API":
-                        dfd_mermaid = get_dfd_anthropic(_dfd_api_key, selected_model, dfd_prompt)
-                    elif model_provider == "Google AI API":
-                        dfd_mermaid = get_dfd_google(_dfd_api_key, selected_model, dfd_prompt)
                     elif model_provider == "Mistral API":
                         dfd_mermaid = get_dfd_mistral(_dfd_api_key, selected_model, dfd_prompt)
                     elif model_provider == "Groq API":
@@ -1886,23 +1735,9 @@ Three ways to use this tab:
                     try:
                         image_bytes = uploaded_dfd_image.read()
                         base64_image = base64.b64encode(image_bytes).decode("utf-8")
-                        media_type = (
-                            "image/png" if uploaded_dfd_image.type == "image/png" else "image/jpeg"
+                        dfd_mermaid = get_dfd_from_image_openai(
+                            _dfd_api_key, selected_model, base64_image
                         )
-                        if model_provider == "OpenAI API":
-                            dfd_mermaid = get_dfd_from_image_openai(
-                                _dfd_api_key, selected_model, base64_image
-                            )
-                        elif model_provider == "Anthropic API":
-                            dfd_mermaid = get_dfd_from_image_anthropic(
-                                _dfd_api_key, selected_model, base64_image, media_type
-                            )
-                        elif model_provider == "Google AI API":
-                            dfd_mermaid = get_dfd_from_image_google(
-                                _dfd_api_key, selected_model, base64_image
-                            )
-                        else:
-                            dfd_mermaid = ""
                         st.session_state["dfd_mermaid"] = dfd_mermaid
                         st.session_state["dfd_last_upload_key"] = upload_key
                         st.session_state.pop("confirmed_dfd", None)
@@ -1996,10 +1831,6 @@ the security posture of the application and protect against potential attacks.
             # Generate the prompt using the create_mitigations_prompt function
             mitigations_prompt = create_mitigations_prompt(threats_markdown, is_genai=is_genai, is_agentic=is_agentic)
 
-            # Clear thinking content when switching models or starting a new operation
-            if model_provider != "Anthropic API" or "thinking" not in selected_model.lower():
-                st.session_state.pop("last_thinking_content", None)
-
             # Show a spinner while suggesting mitigations
             with st.spinner("Suggesting mitigations..."):
                 max_retries = 3
@@ -2011,17 +1842,9 @@ the security posture of the application and protect against potential attacks.
                             mitigations_markdown = get_mitigations(
                                 openai_api_key, selected_model, mitigations_prompt
                             )
-                        elif model_provider == "Google AI API":
-                            mitigations_markdown = get_mitigations_google(
-                                google_api_key, selected_model, mitigations_prompt
-                            )
                         elif model_provider == "Mistral API":
                             mitigations_markdown = get_mitigations_mistral(
                                 mistral_api_key, selected_model, mitigations_prompt
-                            )
-                        elif model_provider == "Anthropic API":
-                            mitigations_markdown = get_mitigations_anthropic(
-                                anthropic_api_key, selected_model, mitigations_prompt
                             )
                         elif model_provider == "LM Studio Server":
                             mitigations_markdown = get_mitigations_lm_studio(
@@ -2038,27 +1861,6 @@ the security posture of the application and protect against potential attacks.
                             mitigations_markdown = get_mitigations_deepseek(
                                 deepseek_api_key, selected_model, mitigations_prompt
                             )
-
-                        # Display thinking content in an expander if available and using a model with thinking capabilities
-                        if (
-                            "last_thinking_content" in st.session_state
-                            and st.session_state["last_thinking_content"]
-                            and (
-                                (
-                                    model_provider == "Anthropic API"
-                                    and "thinking" in selected_model.lower()
-                                )
-                                or (
-                                    model_provider == "Google AI API"
-                                    and ("gemini-2.5" in selected_model.lower() or "gemini-3" in selected_model.lower())
-                                )
-                            )
-                        ):
-                            thinking_model = (
-                                "Claude" if model_provider == "Anthropic API" else "Gemini"
-                            )
-                            with st.expander(f"View {thinking_model}'s thinking process"):
-                                st.markdown(st.session_state["last_thinking_content"])
 
                         # Display the suggested mitigations in Markdown
                         st.markdown(mitigations_markdown)
@@ -2115,10 +1917,6 @@ focusing on the most critical threats first. Use this tab to perform a DREAD ris
             is_agentic = app_type == "Agentic AI application"
             # Generate the prompt using the create_dread_assessment_prompt function
             dread_assessment_prompt = create_dread_assessment_prompt(threats_markdown, is_genai=is_genai, is_agentic=is_agentic)
-            # Clear thinking content when switching models or starting a new operation
-            if model_provider != "Anthropic API" or "thinking" not in selected_model.lower():
-                st.session_state.pop("last_thinking_content", None)
-
             # Show a spinner while generating DREAD Risk Assessment
             with st.spinner("Generating DREAD Risk Assessment..."):
                 max_retries = 3
@@ -2130,17 +1928,9 @@ focusing on the most critical threats first. Use this tab to perform a DREAD ris
                             dread_assessment = get_dread_assessment(
                                 openai_api_key, selected_model, dread_assessment_prompt
                             )
-                        elif model_provider == "Google AI API":
-                            dread_assessment = get_dread_assessment_google(
-                                google_api_key, selected_model, dread_assessment_prompt
-                            )
                         elif model_provider == "Mistral API":
                             dread_assessment = get_dread_assessment_mistral(
                                 mistral_api_key, selected_model, dread_assessment_prompt
-                            )
-                        elif model_provider == "Anthropic API":
-                            dread_assessment = get_dread_assessment_anthropic(
-                                anthropic_api_key, selected_model, dread_assessment_prompt
                             )
                         elif model_provider == "LM Studio Server":
                             dread_assessment = get_dread_assessment_lm_studio(
@@ -2184,19 +1974,6 @@ focusing on the most critical threats first. Use this tab to perform a DREAD ris
                 st.warning(
                     "Debug: The DREAD assessment response is empty. Please ensure you have generated a threat model first."
                 )
-
-            # Display thinking content in an expander if available and using a model with thinking capabilities
-            if (
-                "last_thinking_content" in st.session_state
-                and st.session_state["last_thinking_content"]
-                and (
-                    (model_provider == "Anthropic API" and st.session_state.get("use_thinking", False))
-                    or (model_provider == "Google AI API" and ("gemini-2.5" in selected_model.lower() or "gemini-3" in selected_model.lower()))
-                )
-            ):
-                thinking_model = "Claude" if model_provider == "Anthropic API" else "Gemini"
-                with st.expander(f"View {thinking_model}'s thinking process"):
-                    st.markdown(st.session_state["last_thinking_content"])
 
             # Display the DREAD assessment with a header
             st.markdown("## DREAD Risk Assessment")
@@ -2249,10 +2026,6 @@ scenarios.
             # Generate the prompt using the create_test_cases_prompt function
             test_cases_prompt = create_test_cases_prompt(threats_markdown, is_genai=is_genai, is_agentic=is_agentic)
 
-            # Clear thinking content when switching models or starting a new operation
-            if model_provider != "Anthropic API" or "thinking" not in selected_model.lower():
-                st.session_state.pop("last_thinking_content", None)
-
             # Show a spinner while generating test cases
             with st.spinner("Generating test cases..."):
                 max_retries = 3
@@ -2264,17 +2037,9 @@ scenarios.
                             test_cases_markdown = get_test_cases(
                                 openai_api_key, selected_model, test_cases_prompt
                             )
-                        elif model_provider == "Google AI API":
-                            test_cases_markdown = get_test_cases_google(
-                                google_api_key, selected_model, test_cases_prompt
-                            )
                         elif model_provider == "Mistral API":
                             test_cases_markdown = get_test_cases_mistral(
                                 mistral_api_key, selected_model, test_cases_prompt
-                            )
-                        elif model_provider == "Anthropic API":
-                            test_cases_markdown = get_test_cases_anthropic(
-                                anthropic_api_key, selected_model, test_cases_prompt
                             )
                         elif model_provider == "LM Studio Server":
                             test_cases_markdown = get_test_cases_lm_studio(
@@ -2291,27 +2056,6 @@ scenarios.
                             test_cases_markdown = get_test_cases_deepseek(
                                 deepseek_api_key, selected_model, test_cases_prompt
                             )
-
-                        # Display thinking content in an expander if available and using a model with thinking capabilities
-                        if (
-                            "last_thinking_content" in st.session_state
-                            and st.session_state["last_thinking_content"]
-                            and (
-                                (
-                                    model_provider == "Anthropic API"
-                                    and "thinking" in selected_model.lower()
-                                )
-                                or (
-                                    model_provider == "Google AI API"
-                                    and ("gemini-2.5" in selected_model.lower() or "gemini-3" in selected_model.lower())
-                                )
-                            )
-                        ):
-                            thinking_model = (
-                                "Claude" if model_provider == "Anthropic API" else "Gemini"
-                            )
-                            with st.expander(f"View {thinking_model}'s thinking process"):
-                                st.markdown(st.session_state["last_thinking_content"])
 
                         # Display the suggested mitigations in Markdown
                         st.markdown(test_cases_markdown)

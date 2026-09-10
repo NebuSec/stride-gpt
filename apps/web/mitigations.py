@@ -195,15 +195,6 @@ def get_mitigations(api_key, model_name, prompt):
     return content
 
 
-# Function to get mitigations from the Google model's response.
-def get_mitigations_google(google_api_key, google_model, prompt):
-    config = LLMConfig(provider="Google AI API", model_name=google_model, api_key=google_api_key)
-    content, response = generate_mitigations(config, prompt)
-    if response.thinking:
-        st.session_state["last_thinking_content"] = response.thinking
-    return content
-
-
 # Function to get mitigations from the Mistral model's response.
 def get_mitigations_mistral(mistral_api_key, mistral_model, prompt):
     config = LLMConfig(provider="Mistral API", model_name=mistral_model, api_key=mistral_api_key)
@@ -215,20 +206,6 @@ def get_mitigations_mistral(mistral_api_key, mistral_model, prompt):
 def get_mitigations_deepseek(deepseek_api_key, deepseek_model, prompt):
     config = LLMConfig(provider="DeepSeek API", model_name=deepseek_model, api_key=deepseek_api_key)
     content, _response = generate_mitigations(config, prompt)
-    return content
-
-
-# Function to get mitigations from the Anthropic model's response.
-def get_mitigations_anthropic(anthropic_api_key, anthropic_model, prompt):
-    config = LLMConfig(
-        provider="Anthropic API",
-        model_name=anthropic_model,
-        api_key=anthropic_api_key,
-        use_thinking=st.session_state.get("use_thinking", False),
-    )
-    content, response = generate_mitigations(config, prompt)
-    if response.thinking:
-        st.session_state["last_thinking_content"] = response.thinking
     return content
 
 

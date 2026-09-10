@@ -261,15 +261,6 @@ def get_dread_assessment(api_key, model_name, prompt):
     return parsed
 
 
-# Function to get DREAD risk assessment from the Google model's response.
-def get_dread_assessment_google(google_api_key, google_model, prompt):
-    config = LLMConfig(provider="Google AI API", model_name=google_model, api_key=google_api_key)
-    parsed, response = generate_dread_assessment(config, prompt)
-    if response.thinking:
-        st.session_state["last_thinking_content"] = response.thinking
-    return parsed
-
-
 # Function to get DREAD risk assessment from the Mistral model's response.
 def get_dread_assessment_mistral(mistral_api_key, mistral_model, prompt):
     config = LLMConfig(provider="Mistral API", model_name=mistral_model, api_key=mistral_api_key)
@@ -281,20 +272,6 @@ def get_dread_assessment_mistral(mistral_api_key, mistral_model, prompt):
 def get_dread_assessment_deepseek(deepseek_api_key, deepseek_model, prompt):
     config = LLMConfig(provider="DeepSeek API", model_name=deepseek_model, api_key=deepseek_api_key)
     parsed, _response = generate_dread_assessment(config, prompt)
-    return parsed
-
-
-# Function to get DREAD risk assessment from the Anthropic model's response.
-def get_dread_assessment_anthropic(anthropic_api_key, anthropic_model, prompt):
-    config = LLMConfig(
-        provider="Anthropic API",
-        model_name=anthropic_model,
-        api_key=anthropic_api_key,
-        use_thinking=st.session_state.get("use_thinking", False),
-    )
-    parsed, response = generate_dread_assessment(config, prompt)
-    if response.thinking:
-        st.session_state["last_thinking_content"] = response.thinking
     return parsed
 
 
