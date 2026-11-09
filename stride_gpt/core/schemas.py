@@ -11,10 +11,10 @@ from pydantic import BaseModel
 class LLMConfig(BaseModel):
     """Configuration for an LLM call. Constructed by UI layer from session state."""
 
-    provider: str  # "OpenAI API", "Mistral API", "Groq API", etc.
-    model_name: str  # bare name e.g. "gpt-5.4", "llama-3.3-70b-versatile"
+    provider: str  # "OpenAI API"
+    model_name: str  # bare name e.g. "gpt-6-sol"
     api_key: str  # BYOK key, passed per-call
-    api_base: str | None = None  # For LM Studio custom endpoints
+    api_base: str | None = None  # Custom Responses-compatible endpoint
     timeout: int | None = None  # Request timeout in seconds
     max_tokens: int | None = None  # Override default max tokens
     response_format: str | dict = "text"  # "text", "json", or a JSON schema dict
@@ -27,6 +27,9 @@ class ToolCallResult:
     id: str
     function_name: str
     arguments: dict[str, Any]
+    # Set when the model's arguments couldn't be parsed into a JSON object.
+    # ``arguments`` is then ``{}`` and the call must not be executed.
+    parse_error: str | None = None
 
 
 @dataclass
@@ -35,9 +38,78 @@ class LLMResponse:
 
     content: str  # The main text response
     thinking: str | None = None  # Responses API reasoning summaries
-    reasoning: str | None = None  # <think> tag reasoning (Groq/DeepSeek)
+    reasoning: str | None = None  # Unset on the Responses path
     model: str = ""  # Model that actually responded
     tool_calls: list[ToolCallResult] | None = None
+    # Usage the provider reported for this call. ``None`` means the provider
+    # didn't report it — kept distinct from ``0`` so callers never mistake
+    # "unknown" for "free".
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    # The prompt-cache split of ``prompt_tokens``, where the provider reports
+    # one (DeepSeek, OpenAI and Gemini cache prefixes automatically). ``None``
+    # means the provider said nothing about caching; when set, the two sum
+    # to ``prompt_tokens``.
+    cached_prompt_tokens: int | None = None
+    uncached_prompt_tokens: int | None = None
+
+
+def _add(total: int | None, value: int | None) -> int | None:
+    """Add ``value`` to a running total, leaving ``None`` alone until a real
+    figure arrives."""
+    if value is None:
+        return total
+    return (total or 0) + value
+
+
+class TokenUsage(BaseModel):
+    """Aggregated prompt/completion token usage across one or more LLM calls.
+
+    Both fields stay ``None`` until a response that actually reported usage
+    is folded in — a provider that never reports usage (some local Ollama
+    models via LM Studio) must read as "unknown", not "zero", or a token
+    budget would think nothing was spent and run unbounded.
+    """
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    # Prompt-cache split, summed only over calls whose provider reported one.
+    # ``None`` means no call did. If some calls reported a split and others
+    # didn't, the two fall short of ``prompt_tokens`` by the unreported part.
+    cached_prompt_tokens: int | None = None
+    uncached_prompt_tokens: int | None = None
+
+    @property
+    def available(self) -> bool:
+        return self.prompt_tokens is not None or self.completion_tokens is not None
+
+    @property
+    def total_tokens(self) -> int | None:
+        if not self.available:
+            return None
+        return (self.prompt_tokens or 0) + (self.completion_tokens or 0)
+
+    def record(self, response: LLMResponse) -> None:
+        """Fold one LLM response's usage into this total, in place."""
+        if response.prompt_tokens is None and response.completion_tokens is None:
+            return
+        self.prompt_tokens = (self.prompt_tokens or 0) + (response.prompt_tokens or 0)
+        self.completion_tokens = (self.completion_tokens or 0) + (response.completion_tokens or 0)
+        self.cached_prompt_tokens = _add(self.cached_prompt_tokens, response.cached_prompt_tokens)
+        self.uncached_prompt_tokens = _add(
+            self.uncached_prompt_tokens, response.uncached_prompt_tokens
+        )
+
+    def merge(self, other: TokenUsage) -> None:
+        """Fold another aggregate's totals into this one, in place."""
+        if not other.available:
+            return
+        self.prompt_tokens = (self.prompt_tokens or 0) + (other.prompt_tokens or 0)
+        self.completion_tokens = (self.completion_tokens or 0) + (other.completion_tokens or 0)
+        self.cached_prompt_tokens = _add(self.cached_prompt_tokens, other.cached_prompt_tokens)
+        self.uncached_prompt_tokens = _add(
+            self.uncached_prompt_tokens, other.uncached_prompt_tokens
+        )
 
 
 @dataclass
@@ -78,6 +150,36 @@ class AnalysisPlan(BaseModel):
     # Planner-detected application type. The agent uses this as a hint for
     # which OWASP reference cards to load during per-subsystem analysis.
     detected_app_type: Literal["web", "genai", "agentic"] = "web"
+    # How many files matched ``KEY_PATTERNS`` and how many of them the
+    # planner prompt actually listed (issue #175). ``None`` on plans that
+    # predate these fields.
+    key_files_found: int | None = None
+    key_files_shown: int | None = None
+
+
+# Why a subsystem stopped. A closed set, so a consumer of findings.json can
+# tell a clean analysis with nothing to report from one that crashed:
+#
+# * ``completed`` — the model called ``finish`` (or answered in full).
+# * ``budget_exhausted`` — the call/tool budget ran out and the grace round ran.
+# * ``parse_failed`` — the model ended on text that carried no usable JSON and
+#   nothing had come through the reporting tools, so the finding is empty.
+# * ``unfinished`` — the model ended on text without calling ``finish`` after
+#   reporting threats. The threats are kept; the analysis may be incomplete.
+# * ``error`` — the subsystem raised; see ``error_class``.
+SubsystemOutcome = Literal[
+    "completed", "budget_exhausted", "parse_failed", "unfinished", "error"
+]
+
+# What kind of failure an ``error`` outcome was, classified from the exception
+# rather than from its message text. See ``stride_gpt.agent.errors``.
+ErrorClass = Literal[
+    "context_overflow", "rate_limited", "auth", "provider_error", "unexpected"
+]
+
+# Outcomes where the model really did analyse the subsystem. A grace round
+# still produces a genuine finding, so it doesn't make a run partial.
+ANALYSED_OUTCOMES: frozenset[str] = frozenset({"completed", "budget_exhausted"})
 
 
 class SubsystemFinding(BaseModel):
@@ -87,6 +189,28 @@ class SubsystemFinding(BaseModel):
     threats: list[dict[str, Any]]
     improvement_suggestions: list[str] = []
     files_analyzed: list[str] = []
+    # Defaults to ``completed`` so a findings.json written before outcomes
+    # existed still loads — a run that recorded a finding at all had reached
+    # the subsystem.
+    outcome: SubsystemOutcome = "completed"
+    error_class: ErrorClass | None = None
+    # Token usage this subsystem's own LLM calls incurred (exploration,
+    # compression, and the grace round). ``TokenUsage()`` (unavailable) for
+    # findings recorded before this existed.
+    token_usage: TokenUsage = TokenUsage()
+
+
+def count_outcomes(findings: list[SubsystemFinding]) -> dict[str, int]:
+    """Per-outcome subsystem counts, omitting outcomes that didn't occur."""
+    counts: dict[str, int] = {}
+    for finding in findings:
+        counts[finding.outcome] = counts.get(finding.outcome, 0) + 1
+    return counts
+
+
+def count_analysed(findings: list[SubsystemFinding]) -> int:
+    """How many subsystems the model actually analysed."""
+    return sum(1 for f in findings if f.outcome in ANALYSED_OUTCOMES)
 
 
 class AnalysisReport(BaseModel):
@@ -94,7 +218,13 @@ class AnalysisReport(BaseModel):
 
     plan: AnalysisPlan
     findings: list[SubsystemFinding]
+    # Emergent threats only: ones that exist in the interaction between
+    # subsystems and carry their own evidence. They count as threats.
     cross_cutting_threats: list[dict[str, Any]] = []
+    # Aggregations: systemic restatements of subsystem threats, each linking to
+    # what it summarises by threat id. Observations, not threats — never
+    # counted in totals and never emitted as SARIF results.
+    systemic_observations: list[dict[str, Any]] = []
     # System-level Data Flow Diagram in Mermaid `flowchart` form. Generated
     # during synthesis from the full set of subsystem findings. None when
     # generation was skipped or failed — DFD is auxiliary, not load-bearing.

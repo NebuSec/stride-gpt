@@ -7,7 +7,6 @@ import ...`) continue to work.
 from stride_gpt.core.prompts.builder import (
     create_agentic_stride_prompt_section,
     create_attack_tree_schema,
-    create_attack_tree_schema_lm_studio,
     create_dfd_image_analysis_prompt,
     create_dfd_prompt,
     create_image_analysis_prompt,
@@ -32,7 +31,6 @@ __all__ = [
     "coerce_app_type",
     "create_agentic_stride_prompt_section",
     "create_attack_tree_schema",
-    "create_attack_tree_schema_lm_studio",
     "create_dfd_image_analysis_prompt",
     "create_dfd_prompt",
     "create_image_analysis_prompt",

@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-import httpx
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
@@ -50,99 +49,6 @@ def quick_reports_dir() -> Path:
     return REPORTS_DIR / "quick"
 
 
-def fetch_local_models(provider_name: str, api_base: str) -> list[str]:
-    """Discover available models from a local LM Studio instance.
-
-    Returns a list of model name strings, or an empty list on failure.
-    """
-    try:
-        if provider_name == "LM Studio":
-            url = api_base.rstrip("/") + "/v1/models"
-            resp = httpx.get(url, timeout=5)
-            resp.raise_for_status()
-            return [m["id"] for m in resp.json().get("data", [])]
-    except (httpx.HTTPError, KeyError, TypeError):
-        # Probing LM Studio is best-effort: the server is optional and may be
-        # down, unreachable, or serving a payload we do not recognise. Any of
-        # those means "no models to offer", which is the empty list below.
-        pass
-    return []
-
-
-MIN_CONTEXT_LENGTH = 16384  # Minimum context length recommended for agentic analysis
-DEFAULT_LM_STUDIO_MAX_TOKENS = 8000  # Output cap when context length is unknown
-
-
-def get_lm_studio_context_length(api_base: str, model_name: str) -> int | None:
-    """Return the loaded context length for an LM Studio model, or None if unknown."""
-    try:
-        url = api_base.rstrip("/") + "/api/v1/models"
-        resp = httpx.get(url, timeout=5)
-        resp.raise_for_status()
-        for model in resp.json().get("models", []):
-            if model.get("key") != model_name:
-                continue
-            loaded_instances = model.get("loaded_instances", [])
-            if not loaded_instances:
-                return None
-            loaded = loaded_instances[0].get("config", {}).get("context_length")
-            return int(loaded) if loaded else None
-    except (httpx.HTTPError, KeyError, TypeError, ValueError):
-        return None
-    return None
-
-
-def suggest_max_tokens(context_length: int | None) -> int:
-    """Pick a sensible output token budget given a context window.
-
-    Defaults to ~25% of context, floored at DEFAULT_LM_STUDIO_MAX_TOKENS. Users
-    can override in the wizard or via --max-tokens.
-    """
-    if not context_length:
-        return DEFAULT_LM_STUDIO_MAX_TOKENS
-    return max(DEFAULT_LM_STUDIO_MAX_TOKENS, context_length // 4)
-
-
-def check_lm_studio_context(
-    api_base: str, model_name: str, console: Console | None = None,
-) -> bool:
-    """Check whether an LM Studio model has adequate context for agentic analysis.
-
-    Queries the native /api/v1/models endpoint for the loaded context length.
-    Returns True if context is sufficient or unknown. Returns False if too small.
-    """
-    try:
-        url = api_base.rstrip("/") + "/api/v1/models"
-        resp = httpx.get(url, timeout=5)
-        resp.raise_for_status()
-        for model in resp.json().get("models", []):
-            if model.get("key") != model_name:
-                continue
-            max_ctx = model.get("max_context_length", 0)
-            loaded_instances = model.get("loaded_instances", [])
-            if not loaded_instances:
-                continue
-            loaded_ctx = loaded_instances[0].get("config", {}).get("context_length", 0)
-            if loaded_ctx >= MIN_CONTEXT_LENGTH:
-                return True
-            if console:
-                console.print(
-                    f"\n[bold red]Context window too small.[/bold red] "
-                    f"'{model_name}' is loaded with [bold]{loaded_ctx:,}[/bold] tokens "
-                    f"(max supported: {max_ctx:,}).\n"
-                    f"[yellow]Agentic analysis needs at least {MIN_CONTEXT_LENGTH:,} tokens "
-                    f"(32,768+ recommended). Increase the context length in LM Studio's "
-                    f"model settings and reload the model.[/yellow]\n"
-                )
-            return False
-    except (httpx.HTTPError, KeyError, TypeError, ValueError):
-        # Same best-effort probe as above. A failure here means we could not
-        # read the loaded context length, not that it is too small, so the
-        # check declines to block and returns True below.
-        pass
-    return True  # Can't check — proceed optimistically
-
-
 def load_config() -> dict[str, Any] | None:
     """Load config from ~/.stride-gpt/config.json. Returns None if not found
     or missing the required worker tier (the wizard will run)."""
@@ -182,6 +88,15 @@ def _cancel(console: Console) -> None:
     console.print("\n[dim]Setup cancelled.[/dim]")
 
 
+class _CancellableConfirm(Confirm):
+    """A y/n prompt that also takes q. Returns None when the user cancels."""
+
+    def process_response(self, value: str) -> bool | None:
+        if _is_quit(value):
+            return None
+        return super().process_response(value)
+
+
 TIER_BLURB = {
     "worker": (
         "Worker model — the default tier. Most of STRIDE-GPT's calls run "
@@ -212,11 +127,7 @@ def _setup_tier(console: Console, tier: str) -> dict[str, Any] | None:
     provider_names = list(PROVIDERS.keys())
     table = Table(show_header=False, box=None, padding=(0, 2))
     for i, name in enumerate(provider_names, 1):
-        info = PROVIDERS[name]
-        detail = ""
-        if not info.needs_api_key:
-            detail = " [dim](local)[/dim]"
-        table.add_row(f"  [bold]{i}[/bold]", f"{name}{detail}")
+        table.add_row(f"  [bold]{i}[/bold]", name)
 
     console.print("[bold]Select a provider:[/bold]")
     console.print(table)
@@ -250,151 +161,72 @@ def _setup_tier(console: Console, tier: str) -> dict[str, Any] | None:
     console.print(f"  [green]Selected: {provider_name}[/green]")
     console.print()
 
-    # Step 2: Pick model (cloud providers only — local providers pick after endpoint discovery)
+    # Step 2: Pick model
     model_name = ""
-    if not provider.needs_api_base:
-        models = [m.model_id for m in get_models_for_provider(provider.provider_key)]
-        if models:
-            console.print("[bold]Select a model:[/bold]")
-            for i, model in enumerate(models, 1):
-                console.print(f"  [bold]{i}[/bold]  {model}")
-            console.print(f"  [bold]{len(models) + 1}[/bold]  [dim]Custom (enter model name)[/dim]")
-            console.print()
+    models = [m.model_id for m in get_models_for_provider(provider.provider_key)]
+    if models:
+        console.print("[bold]Select a model:[/bold]")
+        for i, model in enumerate(models, 1):
+            console.print(f"  [bold]{i}[/bold]  {model}")
+        console.print(f"  [bold]{len(models) + 1}[/bold]  [dim]Custom (enter model name)[/dim]")
+        console.print()
 
-            while True:
-                model_choice = Prompt.ask("Model", default="1")
-                if _is_quit(model_choice):
-                    _cancel(console)
-                    return None
-                try:
-                    midx = int(model_choice) - 1
-                    if 0 <= midx < len(models):
-                        model_name = models[midx]
-                        break
-                    if midx == len(models):
-                        model_name = Prompt.ask("Enter model name")
-                        if _is_quit(model_name):
-                            _cancel(console)
-                            return None
-                        break
-                except ValueError:
-                    model_name = model_choice  # Treat as raw model name
-                    break
-        else:
-            model_name = Prompt.ask("Enter model name")
-            if _is_quit(model_name):
+        while True:
+            model_choice = Prompt.ask("Model", default="1")
+            if _is_quit(model_choice):
                 _cancel(console)
                 return None
+            try:
+                midx = int(model_choice) - 1
+                if 0 <= midx < len(models):
+                    model_name = models[midx]
+                    break
+                if midx == len(models):
+                    model_name = Prompt.ask("Enter model name")
+                    if _is_quit(model_name):
+                        _cancel(console)
+                        return None
+                    break
+            except ValueError:
+                model_name = model_choice  # Treat as raw model name
+                break
+    else:
+        model_name = Prompt.ask("Enter model name")
+        if _is_quit(model_name):
+            _cancel(console)
+            return None
 
-        console.print(f"  [green]Model: {model_name}[/green]")
-        console.print()
+    console.print(f"  [green]Model: {model_name}[/green]")
+    console.print()
 
     # Step 3: API key — read from .env file or environment variables
-    if provider.needs_api_key:
-        import os
+    import os
 
-        env_var = provider.env_var
-        env_key = os.environ.get(env_var or "")
-        if env_key:
-            masked = env_key[:8] + "..." + env_key[-4:]
-            console.print(f"  [green]Found {env_var} ({masked})[/green]")
-        else:
-            console.print(
-                Panel(
-                    f"Add your API key to [bold cyan]{CONFIG_DIR / '.env'}[/bold cyan]:\n\n"
-                    f"  {env_var}=your-api-key-here\n\n"
-                    f"This file is loaded automatically on startup.",
-                    title="[bold yellow]API Key Required[/bold yellow]",
-                    style="yellow",
-                )
+    env_var = provider.env_var
+    env_key = os.environ.get(env_var or "")
+    if env_key:
+        masked = env_key[:8] + "..." + env_key[-4:]
+        console.print(f"  [green]Found {env_var} ({masked})[/green]")
+    else:
+        console.print(
+            Panel(
+                f"Add your API key to [bold cyan]{CONFIG_DIR / '.env'}[/bold cyan]:\n\n"
+                f"  {env_var}=your-api-key-here\n\n"
+                f"This file is loaded automatically on startup.",
+                title="[bold yellow]API Key Required[/bold yellow]",
+                style="yellow",
             )
-            if not Confirm.ask("Continue setup without the key for now?", default=True):
-                _cancel(console)
-                return None
-
-    # Step 4: API base (for LM Studio)
-    api_base = None
-    if provider.needs_api_base:
-        default_base = provider.default_api_base or "http://localhost:11434"
-        api_base = Prompt.ask("API base URL", default=default_base)
-        if _is_quit(api_base):
+        )
+        if not _CancellableConfirm.ask("Continue setup without the key for now?", default=True):
             _cancel(console)
             return None
-
-        # Auto-discover models from the local server
-        console.print(f"  [dim]Checking {api_base} for available models...[/dim]")
-        discovered = fetch_local_models(provider_name, api_base)
-        if discovered:
-            console.print(f"  [green]Found {len(discovered)} model(s)[/green]")
-            console.print()
-            console.print("[bold]Select a model:[/bold]")
-            for i, m in enumerate(discovered, 1):
-                console.print(f"  [bold]{i}[/bold]  {m}")
-            console.print(f"  [bold]{len(discovered) + 1}[/bold]  [dim]Custom (enter model name)[/dim]")
-            console.print()
-
-            while True:
-                model_choice = Prompt.ask("Model", default="1")
-                if _is_quit(model_choice):
-                    _cancel(console)
-                    return None
-                try:
-                    midx = int(model_choice) - 1
-                    if 0 <= midx < len(discovered):
-                        model_name = discovered[midx]
-                        break
-                    if midx == len(discovered):
-                        model_name = Prompt.ask("Enter model name")
-                        if _is_quit(model_name):
-                            _cancel(console)
-                            return None
-                        break
-                except ValueError:
-                    model_name = model_choice
-                    break
-
-            console.print(f"  [green]Model: {model_name}[/green]")
-            console.print()
-        else:
-            console.print("  [yellow]Could not connect or no models found.[/yellow]")
-            if not model_name:
-                model_name = Prompt.ask("Enter model name")
-                if _is_quit(model_name):
-                    _cancel(console)
-                    return None
-
-    # Step 5: Max output tokens (LM Studio only — cloud providers have sane defaults)
-    max_tokens: int | None = None
-    if provider.needs_api_base and model_name:
-        ctx = get_lm_studio_context_length(api_base, model_name) if api_base else None
-        suggested = suggest_max_tokens(ctx)
-        if ctx:
-            console.print(
-                f"  [dim]Loaded context window: {ctx:,} tokens. "
-                f"Suggested output budget: {suggested:,}.[/dim]"
-            )
-        else:
-            console.print(
-                f"  [dim]Could not read context length from LM Studio. "
-                f"Suggested output budget: {suggested:,}.[/dim]"
-            )
-        raw = Prompt.ask("Max output tokens", default=str(suggested))
-        if _is_quit(raw):
-            _cancel(console)
-            return None
-        try:
-            max_tokens = int(raw)
-        except ValueError:
-            console.print(f"  [yellow]Invalid number — using {suggested}.[/yellow]")
-            max_tokens = suggested
-        console.print()
 
     return {
         "provider": provider_name,
         "provider_key": provider.provider_key,
         "model": model_name,
-        "api_base": api_base,
-        "max_tokens": max_tokens,
+        "api_base": None,
+        "max_tokens": None,
     }
 
 
@@ -455,11 +287,15 @@ def _ask_architect(
     has_existing = bool(existing and existing.get("architect_model"))
 
     if not has_existing:
-        if not Confirm.ask(
+        answer = _CancellableConfirm.ask(
             "Configure a separate architect model for planning, synthesis, and "
             "context summarization? (Recommended: a stronger reasoning model)",
-            default=False,
-        ):
+            default=True,
+        )
+        if answer is None:
+            _cancel(console)
+            return False
+        if not answer:
             return None
         tier = _setup_tier(console, "architect")
         return False if tier is None else tier
@@ -477,6 +313,7 @@ def _ask_architect(
             default="k",
         ).strip().lower()
         if _is_quit(choice):
+            _cancel(console)
             return False
         if choice in ("k", "keep"):
             return {
@@ -550,12 +387,6 @@ def get_api_key(config: dict[str, Any], *, tier: str = "worker") -> str:
         if key:
             return key
 
-    # Providers that don't authenticate (LM Studio) must never pick up a cloud
-    # key from the fallbacks below — api_base can point anywhere, so that would
-    # send a real key to an arbitrary host.
-    if provider_info and not provider_info.needs_api_key:
-        return ""
-
     # Architect with no env-var key falls back to worker's key only when
     # both tiers share a provider.
     if tier == "architect":
@@ -565,7 +396,7 @@ def get_api_key(config: dict[str, Any], *, tier: str = "worker") -> str:
         return ""
 
     # Worker tier — last-resort common env vars (legacy behaviour)
-    for var in ("STRIDE_GPT_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "DEEPSEEK_API_KEY"):
+    for var in ("STRIDE_GPT_API_KEY", "OPENAI_API_KEY"):
         key = os.environ.get(var, "")
         if key:
             return key

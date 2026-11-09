@@ -28,10 +28,16 @@ load_dotenv(CONFIG_DIR / ".env")  # Load API keys from ~/.stride-gpt/.env
 import typer
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.table import Table
 
+from stride_gpt.agent.budget import (
+    DEFAULT_MAX_LLM_CALLS,
+    format_llm_call_ceiling,
+    prompt_plan_approval,
+)
 from stride_gpt.config import (
     config_to_model_pair,
     load_config,
@@ -67,9 +73,9 @@ BANNER = rf"""[bold blue]
 
 HELP_TEXT = """
 [bold]Commands:[/bold]
-  [cyan]/analyze[/cyan] [path]        Analyze a codebase for STRIDE threats
+  [cyan]/analyze[/cyan] \\[path]      Analyze a codebase for STRIDE threats
   [cyan]/quick[/cyan]               Quick threat model from a text description
-  [cyan]/reports[/cyan]              List previous analysis reports
+  [cyan]/reports[/cyan]             List previous analysis reports
   [cyan]/config[/cyan]              View or change settings
   [cyan]/help[/cyan]                Show this help
   [cyan]/quit[/cyan]                Exit
@@ -79,12 +85,17 @@ HELP_TEXT = """
   [cyan]-f, --format[/cyan] <fmt>     Output format: markdown (default), json, sarif, html
   [cyan]-y, --yes[/cyan]              Auto-approve the analysis plan
 
+[bold]Flags[/bold] (for /analyze only):
+  [cyan]--resume[/cyan] <checkpoint>  Resume an interrupted run (written next to -o as <stem>.checkpoint.json)
+  [cyan]--force[/cyan]                With --resume, proceed despite a dirty tree or missing git SHA
+
 [bold]Examples:[/bold]
   [cyan]/analyze .[/cyan]                          Analyze current directory
   [cyan]/analyze ./my-app[/cyan]                   Analyze a specific path
   [cyan]/analyze . -o report.md[/cyan]             Save report to file
   [cyan]/analyze . -o report.json -f json[/cyan]   Export as JSON (pairs report.html)
   [cyan]/analyze . -o report.html -f html[/cyan]   Export browser-viewable HTML
+  [cyan]/analyze . -o report.md --resume report.checkpoint.json[/cyan]  Resume a killed run
   [cyan]/quick -i desc.txt -f html -o r.html[/cyan]  Quick model as HTML
   [cyan]/reports[/cyan]                            List recent reports
   [cyan]/reports 1[/cyan]                          View report #1
@@ -252,6 +263,7 @@ def _persist_analyze_intermediates(
     from stride_gpt.core.prompts import base_system_prompt
 
     refs = report.metadata.get("references_loaded", []) or []
+    token_usage = report.metadata.get("token_usage") or {}
     manifest = build_analyze_manifest(
         models=models,
         plan=plan,
@@ -263,9 +275,12 @@ def _persist_analyze_intermediates(
         references_loaded=refs,
         llm_calls=report.metadata.get("llm_calls", 0),
         tool_calls=report.metadata.get("tool_calls", 0),
-        subsystems_analyzed=report.metadata.get(
-            "subsystems_analyzed", len(report.findings)
-        ),
+        findings=report.findings,
+        resumed_subsystems=report.metadata.get("resumed_subsystems", []),
+        rerun_subsystems=report.metadata.get("rerun_subsystems", []),
+        token_usage_by_phase=token_usage.get("by_phase"),
+        synthesis_error_class=report.metadata.get("synthesis_error_class"),
+        synthesis_dropped=report.metadata.get("synthesis_dropped"),
     )
     written = write_intermediates(
         output,
@@ -273,6 +288,7 @@ def _persist_analyze_intermediates(
         plan=plan,
         findings=report.findings,
         cross_cutting=report.cross_cutting_threats,
+        systemic_observations=report.systemic_observations,
         data_flow_diagram=report.data_flow_diagram,
     )
     for path in written:
@@ -315,17 +331,234 @@ def _persist_quick_intermediates(
         console.print(f"[green]Intermediate written to {path}[/green]")
 
 
+def _load_and_validate_checkpoint(resume_path: Path, *, target: Path, models: ModelPair, force: bool):
+    """Load a checkpoint and confirm it's safe to resume against ``target``/``models``.
+
+    Raises ``FileNotFoundError`` if ``resume_path`` doesn't exist, or
+    ``stride_gpt.agent.persistence.CheckpointValidationError`` if resuming
+    from it would be unsound. Callers decide how to report each.
+    """
+    from stride_gpt.agent.persistence import (
+        load_checkpoint,
+        restore_checkpoint_paths,
+        validate_checkpoint_for_resume,
+    )
+
+    if not resume_path.is_file():
+        raise FileNotFoundError(resume_path)
+    checkpoint = load_checkpoint(resume_path)
+    validate_checkpoint_for_resume(
+        checkpoint, target=target, models=models, force=force,
+        checkpoint_path=resume_path,
+    )
+    # The plan and findings come back redacted; the run reports from them, so
+    # they have to be live paths again before anything downstream sees them.
+    return restore_checkpoint_paths(checkpoint, target=target)
+
+
+def _report_provider_failure(exc: Exception) -> bool:
+    """Print one line if ``exc`` is a failed provider call. False for any other error.
+
+    A rejected key, an unreachable endpoint or a provider that keeps failing
+    after retries is something the user fixes outside stride-gpt, so the caller
+    exits cleanly. Any other failure still raises with its traceback.
+    """
+    from stride_gpt.agent.errors import classify_error
+
+    error_class, reason = classify_error(exc)
+    if error_class == "auth":
+        console.print(f"[red]Authentication failed. {reason}[/red]")
+        return True
+    if error_class in ("provider_error", "rate_limited"):
+        console.print(
+            f"[red]The provider call failed after retries. {reason}[/red]\n"
+            "Check the API base URL, your network connection and the provider's status."
+        )
+        return True
+    return False
+
+
+def _prepare_output_dir(output: Path) -> bool:
+    """Create the directory ``-o`` writes into. False, with a message, if it can't be.
+
+    Runs before planning: the first checkpoint is written next to ``output``
+    as soon as the plan is approved, so a missing directory would otherwise
+    crash the run after the planning call has been paid for.
+    """
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        console.print(f"[red]Cannot create {output.parent}: {e.strerror}.[/red]")
+        return False
+    return True
+
+
+def _report_nothing_analysed(report) -> bool:
+    """Print a warning and return True if no subsystem was analysed.
+
+    Every subsystem can fail (a worker key the provider rejects, say) while
+    planning succeeds on the architect, leaving a report with no threats that
+    would otherwise look like a clean run.
+    """
+    if report.metadata.get("status") == "cancelled" or not report.plan.subsystems:
+        return False
+    if report.metadata.get("subsystems_analyzed") != 0:
+        return False
+    console.print(
+        "[red]No subsystem was analysed, so this report has no threats. "
+        "Each subsystem's Status line says why.[/red]"
+    )
+    return True
+
+
+def _resolve_analysis_plan(
+    models: ModelPair,
+    target: Path,
+    *,
+    checkpoint,
+    auto_approve: bool,
+    progress,
+    app_type: AppTypeOverride | None = None,
+    usage=None,
+    max_llm_calls: int = 0,
+):
+    """Get the plan + its app_type_source, from a checkpoint or a fresh Phase 1.
+
+    Returns ``None`` if the user declined to approve a freshly generated
+    plan — a resumed checkpoint's plan was already approved, so it's never
+    re-prompted.
+
+    ``usage``, if given, collects the planning call's tokens. A resumed run
+    never plans, so it stays empty — the tokens the original run spent on
+    planning belong to that run, not this one.
+    """
+    from stride_gpt.agent.loop import create_analysis_plan
+    from stride_gpt.agent.planner import format_plan_for_display
+
+    if checkpoint is not None:
+        return checkpoint.plan, checkpoint.app_type_source
+
+    progress.phase_start("Phase 1", "Planning")
+    progress.status("Scanning codebase and generating plan...")
+    plan = create_analysis_plan(models, target, usage=usage)
+
+    # Provenance follows the flag, not whether the flag changed anything: a
+    # classification the user pinned with --app-type is a user's choice even
+    # when the planner reached the same answer on its own.
+    app_type_source = "planner"
+    if app_type is not None and app_type != AppTypeOverride.auto:
+        app_type_source = f"override:{app_type.value}"
+        if app_type.value != plan.detected_app_type:
+            console.print(
+                f"[dim]Overriding detected type "
+                f"[yellow]{plan.detected_app_type}[/yellow] → "
+                f"[yellow]{app_type.value}[/yellow] (--app-type).[/dim]"
+            )
+            plan = plan.model_copy(update={"detected_app_type": app_type.value})
+
+    console.print(Panel(format_plan_for_display(plan), title="Analysis Plan", style="cyan"))
+    if (
+        plan.key_files_found is not None
+        and plan.key_files_shown is not None
+        and plan.key_files_shown < plan.key_files_found
+    ):
+        console.print(
+            f"[yellow]Warning: the planner saw {plan.key_files_shown} of "
+            f"{plan.key_files_found} key files. Check that no subsystem is "
+            f"missing from the plan.[/yellow]"
+        )
+
+    if not auto_approve:
+        console.print(format_llm_call_ceiling(len(plan.subsystems), max_llm_calls))
+        if not prompt_plan_approval(console):
+            return None
+
+    return plan, app_type_source
+
+
+def _make_checkpoint_writer(
+    checkpoint_path: Path, *, plan: AnalysisPlan, target: Path, output: Path, models: ModelPair,
+    app_type_source: str, started_at: datetime,
+):
+    """Build a callback that atomically checkpoints the findings so far."""
+    from stride_gpt.agent.persistence import build_checkpoint, write_checkpoint
+
+    def _write(findings) -> None:
+        write_checkpoint(
+            checkpoint_path,
+            build_checkpoint(
+                plan=plan, findings=findings, target=target, output=output, models=models,
+                app_type_source=app_type_source, started_at=started_at,
+            ),
+        )
+
+    return _write
+
+
+_API_KEY_FLAGS = ("--worker-api-key", "--architect-api-key")
+
+
+def _resume_command(args: list[str], checkpoint_path: Path) -> str:
+    """The command that resumes an interrupted run from ``checkpoint_path``.
+
+    ``args`` is the interrupted command line. Any ``--resume`` it had is
+    replaced, and API key values are replaced with a placeholder so the
+    printed command doesn't echo a secret.
+    """
+    import shlex
+
+    kept: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        flag = arg.split("=", 1)[0]
+        if flag == "--resume":
+            i += 1 if "=" in arg else 2
+            continue
+        if flag in _API_KEY_FLAGS:
+            kept += [flag, "<api-key>"]
+            i += 1 if "=" in arg else 2
+            continue
+        kept.append(arg)
+        i += 1
+    return shlex.join([*kept, "--resume", str(checkpoint_path)])
+
+
+def _print_resume_hint(checkpoint_path: Path, command: str) -> None:
+    """Tell an interrupted run where its checkpoint is and how to resume."""
+    console.print(f"\n[yellow]Interrupted. Completed subsystems are saved in {escape(str(checkpoint_path))}.[/yellow]")
+    # soft_wrap keeps a long command on one line so it can be copied whole.
+    console.print(f"Resume with: [cyan]{escape(command)}[/cyan]", soft_wrap=True)
+
+
+_REPL_VALUE_FLAGS = {"-o", "--output", "-f", "--format", "--resume", "-i", "--input", "-t", "--type"}
+
+
+def _reject_repl_argument(command: str, arg: str) -> None:
+    """Say why the REPL won't run a command with an argument it doesn't take."""
+    if arg in _REPL_VALUE_FLAGS:
+        console.print(f"[red]{arg} needs a value.[/red] Type /help for usage.")
+    elif arg.startswith("-"):
+        console.print(
+            f"[red]/{command} doesn't take {arg}.[/red] Type /help for the flags it takes, "
+            f"or run [cyan]stride-gpt {command} --help[/cyan] for the full set."
+        )
+    else:
+        console.print(f"[red]Unexpected argument for /{command}: {arg}.[/red] Type /help for usage.")
+
+
 def _handle_analyze(config: dict, args_str: str) -> None:
     """Run agentic analysis from interactive session."""
     from stride_gpt.agent.html_report import render_html
-    from stride_gpt.agent.loop import create_analysis_plan, run_analysis
-    from stride_gpt.agent.planner import format_plan_for_display
+    from stride_gpt.agent.loop import run_analysis
+    from stride_gpt.agent.persistence import CheckpointValidationError, checkpoint_path_for
     from stride_gpt.agent.progress import RichProgress
     from stride_gpt.agent.report import render_json, render_markdown, render_sarif, save_report
+    from stride_gpt.core.schemas import TokenUsage
 
     # Parse inline args
     parts = args_str.split() if args_str else ["."]
-    target_path = Path(parts[0]).resolve()
+    target_path = Path(parts[0]).expanduser().resolve()
 
     if not target_path.is_dir():
         console.print(f"[red]Error: {parts[0]} is not a directory.[/red]")
@@ -334,10 +567,13 @@ def _handle_analyze(config: dict, args_str: str) -> None:
     # Check for -o / --output flag
     output_path = None
     output_format = OutputFormat.markdown
+    resume_path = None
+    force = False
+    auto_approve = False
     i = 1
     while i < len(parts):
         if parts[i] in ("-o", "--output") and i + 1 < len(parts):
-            output_path = Path(parts[i + 1])
+            output_path = Path(parts[i + 1]).expanduser()
             i += 2
         elif parts[i] in ("-f", "--format") and i + 1 < len(parts):
             try:
@@ -347,11 +583,21 @@ def _handle_analyze(config: dict, args_str: str) -> None:
                 return
             i += 2
         elif parts[i] in ("-y", "--yes"):
-            i += 1  # auto_approve handled below
-        else:
+            auto_approve = True
             i += 1
+        elif parts[i] == "--resume" and i + 1 < len(parts):
+            resume_path = Path(parts[i + 1]).expanduser()
+            i += 2
+        elif parts[i] == "--force":
+            force = True
+            i += 1
+        else:
+            _reject_repl_argument("analyze", parts[i])
+            return
 
-    auto_approve = "-y" in args_str or "--yes" in args_str
+    if output_path is not None and not _prepare_output_dir(output_path):
+        return
+
     models = config_to_model_pair(config)
     if models is None:
         console.print("[red]No model configured. Run /config to set one up.[/red]")
@@ -360,32 +606,77 @@ def _handle_analyze(config: dict, args_str: str) -> None:
     if not _check_tier_api_keys(config, models):
         return
 
-    _check_lm_studio_context_for(config, models, console)
+    checkpoint = None
+    if resume_path is not None:
+        try:
+            checkpoint = _load_and_validate_checkpoint(
+                resume_path, target=target_path, models=models, force=force
+            )
+        except FileNotFoundError:
+            console.print(f"[red]Checkpoint not found: {resume_path}[/red]")
+            return
+        except CheckpointValidationError as e:
+            console.print(f"[red]Cannot resume: {e}[/red]")
+            return
 
     console.print(Panel(_panel_target_body(target_path, models), title="[bold]Agentic Analysis[/bold]", style="blue"))
 
     progress = RichProgress(console)
 
-    # Phase 1: Plan
+    # Phase 1: Plan (or reuse a checkpointed one)
     started_at = datetime.now(UTC)
-    progress.phase_start("Phase 1", "Planning")
-    progress.status("Scanning codebase and generating plan...")
-    plan = create_analysis_plan(models, target_path)
-    console.print(Panel(format_plan_for_display(plan), title="Analysis Plan", style="cyan"))
+    planning_usage = TokenUsage()
+    try:
+        resolved = _resolve_analysis_plan(
+            models, target_path, checkpoint=checkpoint, auto_approve=auto_approve,
+            progress=progress, usage=planning_usage, max_llm_calls=DEFAULT_MAX_LLM_CALLS,
+        )
+    except Exception as e:
+        if not _report_provider_failure(e):
+            raise
+        return
+    if resolved is None:
+        console.print("[red]Analysis cancelled.[/red]")
+        return
+    plan, app_type_source = resolved
+    run_started_at = checkpoint.started_at if checkpoint is not None else started_at
 
-    if not auto_approve:
-        response = console.input("[bold yellow]Approve this plan? (y/n/q): [/bold yellow]")
-        if response.lower() not in ("y", "yes"):
-            console.print("[red]Analysis cancelled.[/red]")
-            return
+    resume_findings = None
+    if checkpoint is not None:
+        resume_findings = {f.subsystem: f for f in checkpoint.findings if f.outcome == "completed"}
+        console.print(
+            f"[dim]Resuming from {resume_path} — {len(resume_findings)} subsystem(s) "
+            "already completed.[/dim]"
+        )
+
+    on_checkpoint = None
+    if output_path is not None:
+        checkpoint_path = resume_path if checkpoint is not None else checkpoint_path_for(output_path)
+        on_checkpoint = _make_checkpoint_writer(
+            checkpoint_path, plan=plan, target=target_path, output=output_path, models=models,
+            app_type_source=app_type_source, started_at=run_started_at,
+        )
+        if checkpoint is None:
+            on_checkpoint([])
 
     # Phases 2+3: Analyze with pre-approved plan
-    report = run_analysis(
-        models=models,
-        target_path=target_path,
-        plan=plan,
-        progress=progress,
-    )
+    try:
+        report = run_analysis(
+            models=models,
+            target_path=target_path,
+            plan=plan,
+            progress=progress,
+            resume_findings=resume_findings,
+            on_checkpoint=on_checkpoint,
+            planning_usage=planning_usage,
+            max_llm_calls=DEFAULT_MAX_LLM_CALLS,
+        )
+    except KeyboardInterrupt:
+        if on_checkpoint is not None:
+            _print_resume_hint(
+                checkpoint_path, "/analyze " + _resume_command(parts, checkpoint_path)
+            )
+        raise
     finished_at = datetime.now(UTC)
 
     # Auto-save (skip cancelled runs)
@@ -404,13 +695,13 @@ def _handle_analyze(config: dict, args_str: str) -> None:
         rendered = render_html(report)
 
     if output_path:
-        output_path.write_text(rendered)
+        output_path.write_text(rendered, encoding="utf-8")
         console.print(f"\n[green]Report written to {output_path}[/green]")
         # JSON output pairs an HTML companion next to it — JSON is the machine
         # artifact, HTML is its human view.
         if output_format == OutputFormat.json:
             html_path = output_path.with_suffix(".html")
-            html_path.write_text(render_html(report))
+            html_path.write_text(render_html(report), encoding="utf-8")
             console.print(f"[green]HTML view written to {html_path}[/green]")
         _persist_analyze_intermediates(
             output=output_path,
@@ -418,9 +709,9 @@ def _handle_analyze(config: dict, args_str: str) -> None:
             models=models,
             plan=plan,
             report=report,
-            started_at=started_at,
+            started_at=run_started_at,
             finished_at=finished_at,
-            app_type_source="planner",
+            app_type_source=app_type_source,
         )
     else:
         console.print()
@@ -434,6 +725,8 @@ def _handle_analyze(config: dict, args_str: str) -> None:
     if saved_path:
         _print_saved_paths(saved_path)
         console.print("[dim]View previous reports with[/dim] [cyan]/reports[/cyan]")
+
+    _report_nothing_analysed(report)
 
 
 def _handle_reports(args_str: str) -> None:
@@ -524,7 +817,7 @@ def _handle_reports(args_str: str) -> None:
     i = 1
     while i < len(parts):
         if parts[i] in ("-o", "--output") and i + 1 < len(parts):
-            output_path = Path(parts[i + 1])
+            output_path = Path(parts[i + 1]).expanduser()
             i += 2
         elif parts[i] in ("-f", "--format") and i + 1 < len(parts):
             try:
@@ -546,11 +839,13 @@ def _handle_reports(args_str: str) -> None:
         rendered = render_html_from_json(data)
 
     if output_path:
-        output_path.write_text(rendered)
+        if not _prepare_output_dir(output_path):
+            return
+        output_path.write_text(rendered, encoding="utf-8")
         console.print(f"[green]Report exported to {output_path}[/green]")
         if output_format == OutputFormat.json:
             html_path = output_path.with_suffix(".html")
-            html_path.write_text(render_html_from_json(data))
+            html_path.write_text(render_html_from_json(data), encoding="utf-8")
             console.print(f"[green]HTML view written to {html_path}[/green]")
     else:
         console.print()
@@ -560,6 +855,17 @@ def _handle_reports(args_str: str) -> None:
             console.print("[dim]HTML reports must be written to a file with -o.[/dim]")
         else:
             console.print(rendered)
+
+
+def _quick_report_name(input_file: Path | None) -> str:
+    """Name a saved quick report after the system it describes.
+
+    That is the directory holding the input file, or the working directory
+    when the description came from stdin. The file's own name is no use:
+    every run from a README.md would be saved as ``README_<timestamp>``.
+    """
+    directory = input_file.resolve().parent if input_file else Path.cwd()
+    return directory.name or "quick-analysis"
 
 
 def _handle_quick(config: dict, args_str: str) -> None:
@@ -579,10 +885,10 @@ def _handle_quick(config: dict, args_str: str) -> None:
     i = 0
     while i < len(parts):
         if parts[i] in ("-i", "--input") and i + 1 < len(parts):
-            input_file = Path(parts[i + 1])
+            input_file = Path(parts[i + 1]).expanduser()
             i += 2
         elif parts[i] in ("-o", "--output") and i + 1 < len(parts):
-            output_path = Path(parts[i + 1])
+            output_path = Path(parts[i + 1]).expanduser()
             i += 2
         elif parts[i] in ("-t", "--type") and i + 1 < len(parts):
             hint = parts[i + 1]
@@ -603,7 +909,8 @@ def _handle_quick(config: dict, args_str: str) -> None:
                 return
             i += 2
         else:
-            i += 1
+            _reject_repl_argument("quick", parts[i])
+            return
 
     # Get app description
     if input_file:
@@ -611,7 +918,6 @@ def _handle_quick(config: dict, args_str: str) -> None:
             console.print(f"[red]Error: {input_file} not found.[/red]")
             return
         app_description = input_file.read_text()
-        report_name = input_file.stem
     else:
         console.print("[bold]Describe your application[/bold] (press Enter twice to finish):")
         lines: list[str] = []
@@ -629,7 +935,6 @@ def _handle_quick(config: dict, args_str: str) -> None:
             except (EOFError, KeyboardInterrupt):
                 break
         app_description = "\n".join(lines)
-        report_name = "quick-analysis"
 
     if not app_description.strip():
         console.print("[red]Error: Empty app description.[/red]")
@@ -643,6 +948,9 @@ def _handle_quick(config: dict, args_str: str) -> None:
     if not _check_tier_api_keys(config, models):
         return
 
+    if output_path is not None and not _prepare_output_dir(output_path):
+        return
+
     source = str(input_file) if input_file else "typed description"
     console.print(
         Panel(
@@ -654,13 +962,18 @@ def _handle_quick(config: dict, args_str: str) -> None:
     )
 
     started_at = datetime.now(UTC)
-    with console.status("Analysing description..."):
-        result = run_quick_analysis(models, app_description, hint=hint)
+    try:
+        with console.status("Analysing description..."):
+            result = run_quick_analysis(models, app_description, hint=hint)
+    except Exception as e:
+        if not _report_provider_failure(e):
+            raise
+        return
     finished_at = datetime.now(UTC)
 
     saved_path = save_quick_report(
         result,
-        report_name,
+        _quick_report_name(input_file),
         app_type_hint=hint,
         models=models,
     )
@@ -673,9 +986,9 @@ def _handle_quick(config: dict, args_str: str) -> None:
             # produce byte-identical HTML for the same analysis.
             from stride_gpt.agent.report import load_report
             html = render_html_from_json(load_report(saved_path))
-            output_path.write_text(html)
+            output_path.write_text(html, encoding="utf-8")
         else:
-            output_path.write_text(markdown)
+            output_path.write_text(markdown, encoding="utf-8")
         console.print(f"[green]Report written to {output_path}[/green]")
         _persist_quick_intermediates(
             output=output_path,
@@ -717,28 +1030,31 @@ def _resolve_provider(model: str) -> tuple[str, str]:
 @app.command()
 def analyze(
     path: Annotated[Path, typer.Argument(help="Path to the codebase to analyze.")] = Path(),
-    worker_model: Annotated[str | None, typer.Option(help="Worker model — default tier, handles the bulk of calls (e.g. groq/llama-3.3-70b-versatile). A fast, low-cost model usually pays off here. Uses saved config if omitted.")] = None,
+    worker_model: Annotated[str | None, typer.Option(help="Worker model — default tier, handles the bulk of calls (e.g. openai/gpt-6-luna). A fast, low-cost model usually pays off here. Uses saved config if omitted.")] = None,
     worker_api_key: Annotated[str | None, typer.Option(envvar="STRIDE_GPT_API_KEY", help="Worker API key.")] = None,
-    worker_api_base: Annotated[str | None, typer.Option(help="Worker API base URL (LM Studio).")] = None,
+    worker_api_base: Annotated[str | None, typer.Option(help="Worker API base URL (a Responses-compatible endpoint).")] = None,
     worker_max_tokens: Annotated[int | None, typer.Option(help="Worker per-call output token cap.")] = None,
     architect_model: Annotated[str | None, typer.Option(help="Architect model — used only for the reasoning-heavy moments (planning, cross-cutting synthesis, context summarization). Infrequent but high-leverage; a stronger model is worth the cost. Uses saved config if omitted.")] = None,
     architect_api_key: Annotated[str | None, typer.Option(help="Architect API key.")] = None,
-    architect_api_base: Annotated[str | None, typer.Option(help="Architect API base URL.")] = None,
+    architect_api_base: Annotated[str | None, typer.Option(help="Architect API base URL (a Responses-compatible endpoint).")] = None,
     architect_max_tokens: Annotated[int | None, typer.Option(help="Architect per-call output token cap.")] = None,
     no_architect: Annotated[bool, typer.Option("--no-architect", help="Bypass any saved architect tier for this run; worker handles every call.")] = False,
     output: Annotated[Path | None, typer.Option("-o", "--output", help="Output file path.")] = None,
     output_format: Annotated[OutputFormat, typer.Option("-f", "--format", help="Output format.")] = OutputFormat.markdown,
-    max_llm_calls: Annotated[int, typer.Option(help="Max LLM calls across both tiers (0 = unlimited).")] = 0,
-    max_tool_calls: Annotated[int, typer.Option(help="Max tool executions (0 = unlimited).")] = 0,
+    max_llm_calls: Annotated[int, typer.Option(help="Max LLM calls per subsystem; a subsystem that hits it gets one final round to report what it found, so none is skipped. The default is about twice the ~12 rounds per subsystem a measured full run took (0 = unlimited).")] = DEFAULT_MAX_LLM_CALLS,
+    max_tool_calls: Annotated[int, typer.Option(help="Max code-exploration calls per subsystem; a subsystem that hits it gets one final round to report what it found, so none is skipped. Reporting a threat doesn't spend it (0 = unlimited).")] = 0,
     auto_approve: Annotated[bool, typer.Option("--yes", "-y", help="Auto-approve the analysis plan.")] = False,
     app_type: Annotated[AppTypeOverride, typer.Option("--app-type", help="Override the planner's app-type classification. 'auto' keeps the planner's choice.")] = AppTypeOverride.auto,
+    resume: Annotated[Path | None, typer.Option("--resume", help="Resume an interrupted run from a checkpoint file (written next to -o as <stem>.checkpoint.json).")] = None,
+    force: Annotated[bool, typer.Option("--force", help="Resume even if the target has uncommitted changes or no discoverable git SHA.")] = False,
 ) -> None:
     """Deep agentic analysis of a codebase for STRIDE threats."""
     from stride_gpt.agent.html_report import render_html
-    from stride_gpt.agent.loop import create_analysis_plan, run_analysis
-    from stride_gpt.agent.planner import format_plan_for_display
+    from stride_gpt.agent.loop import run_analysis
+    from stride_gpt.agent.persistence import CheckpointValidationError, checkpoint_path_for
     from stride_gpt.agent.progress import RichProgress
     from stride_gpt.agent.report import render_json, render_markdown, render_sarif, save_report
+    from stride_gpt.core.schemas import TokenUsage
 
     models = _build_model_pair(
         worker_model=worker_model,
@@ -757,7 +1073,19 @@ def analyze(
         console.print(f"[red]Error: {path} is not a directory.[/red]")
         raise typer.Exit(1)
 
-    _check_lm_studio_context_for(load_config() or {}, models, console, exit_on_fail=True)
+    if output is not None and not _prepare_output_dir(output):
+        raise typer.Exit(1)
+
+    checkpoint = None
+    if resume is not None:
+        try:
+            checkpoint = _load_and_validate_checkpoint(resume, target=target, models=models, force=force)
+        except FileNotFoundError:
+            console.print(f"[red]Checkpoint not found: {resume}[/red]")
+            raise typer.Exit(1) from None
+        except CheckpointValidationError as e:
+            console.print(f"[red]Cannot resume: {e}[/red]")
+            raise typer.Exit(1) from e
 
     console.print(
         Panel(
@@ -771,38 +1099,62 @@ def analyze(
 
     progress = RichProgress(console)
 
-    # Phase 1: Plan
+    # Phase 1: Plan (or reuse a checkpointed one)
     started_at = datetime.now(UTC)
-    progress.phase_start("Phase 1", "Planning")
-    progress.status("Scanning codebase and generating plan...")
-    plan = create_analysis_plan(models, target)
-
-    # Apply --app-type override, if any.
-    if app_type != AppTypeOverride.auto and app_type.value != plan.detected_app_type:
-        console.print(
-            f"[dim]Overriding detected type "
-            f"[yellow]{plan.detected_app_type}[/yellow] → "
-            f"[yellow]{app_type.value}[/yellow] (--app-type).[/dim]"
+    planning_usage = TokenUsage()
+    try:
+        resolved = _resolve_analysis_plan(
+            models, target, checkpoint=checkpoint, auto_approve=auto_approve,
+            progress=progress, app_type=app_type, usage=planning_usage,
+            max_llm_calls=max_llm_calls,
         )
-        plan = plan.model_copy(update={"detected_app_type": app_type.value})
+    except Exception as e:
+        if not _report_provider_failure(e):
+            raise
+        raise typer.Exit(1) from None
+    if resolved is None:
+        console.print("[red]Analysis cancelled.[/red]")
+        raise typer.Exit(0)
+    plan, app_type_source = resolved
+    run_started_at = checkpoint.started_at if checkpoint is not None else started_at
 
-    console.print(Panel(format_plan_for_display(plan), title="Analysis Plan", style="cyan"))
+    resume_findings = None
+    if checkpoint is not None:
+        resume_findings = {f.subsystem: f for f in checkpoint.findings if f.outcome == "completed"}
+        console.print(
+            f"[dim]Resuming from {resume} — {len(resume_findings)} subsystem(s) "
+            "already completed.[/dim]"
+        )
 
-    if not auto_approve:
-        response = console.input("[bold yellow]Approve this plan? (y/n/q): [/bold yellow]")
-        if response.lower() not in ("y", "yes"):
-            console.print("[red]Analysis cancelled.[/red]")
-            raise typer.Exit(0)
+    on_checkpoint = None
+    if output is not None:
+        checkpoint_path = resume if checkpoint is not None else checkpoint_path_for(output)
+        on_checkpoint = _make_checkpoint_writer(
+            checkpoint_path, plan=plan, target=target, output=output, models=models,
+            app_type_source=app_type_source, started_at=run_started_at,
+        )
+        if checkpoint is None:
+            on_checkpoint([])
 
     # Phases 2+3: Analyze with pre-approved plan
-    report = run_analysis(
-        models=models,
-        target_path=target,
-        plan=plan,
-        max_llm_calls=max_llm_calls,
-        max_tool_calls=max_tool_calls,
-        progress=progress,
-    )
+    try:
+        report = run_analysis(
+            models=models,
+            target_path=target,
+            plan=plan,
+            max_llm_calls=max_llm_calls,
+            max_tool_calls=max_tool_calls,
+            progress=progress,
+            resume_findings=resume_findings,
+            on_checkpoint=on_checkpoint,
+            planning_usage=planning_usage,
+        )
+    except KeyboardInterrupt:
+        if on_checkpoint is not None:
+            _print_resume_hint(
+                checkpoint_path, "stride-gpt " + _resume_command(sys.argv[1:], checkpoint_path)
+            )
+        raise
     finished_at = datetime.now(UTC)
 
     # Auto-save
@@ -820,24 +1172,19 @@ def analyze(
         rendered = render_html(report)
 
     if output:
-        output.write_text(rendered)
+        output.write_text(rendered, encoding="utf-8")
         console.print(f"\n[green]Report written to {output}[/green]")
         if output_format == OutputFormat.json:
             html_path = output.with_suffix(".html")
-            html_path.write_text(render_html(report))
+            html_path.write_text(render_html(report), encoding="utf-8")
             console.print(f"[green]HTML view written to {html_path}[/green]")
-        app_type_source = (
-            f"override:{app_type.value}"
-            if app_type != AppTypeOverride.auto
-            else "planner"
-        )
         _persist_analyze_intermediates(
             output=output,
             target=target,
             models=models,
             plan=plan,
             report=report,
-            started_at=started_at,
+            started_at=run_started_at,
             finished_at=finished_at,
             app_type_source=app_type_source,
         )
@@ -854,16 +1201,19 @@ def analyze(
         _print_saved_paths(saved_path)
         console.print("[dim]View previous reports with:[/dim] [cyan]stride-gpt reports[/cyan]")
 
+    if _report_nothing_analysed(report):
+        raise typer.Exit(1)
+
 
 @app.command()
 def quick(
     worker_model: Annotated[str | None, typer.Option(help="Worker model — default tier, handles fallback / retry calls. A fast, low-cost model is usually fine here. Uses saved config if omitted.")] = None,
     worker_api_key: Annotated[str | None, typer.Option(envvar="STRIDE_GPT_API_KEY", help="Worker API key.")] = None,
-    worker_api_base: Annotated[str | None, typer.Option(help="Worker API base URL (LM Studio).")] = None,
+    worker_api_base: Annotated[str | None, typer.Option(help="Worker API base URL (a Responses-compatible endpoint).")] = None,
     worker_max_tokens: Annotated[int | None, typer.Option(help="Worker per-call output token cap.")] = None,
     architect_model: Annotated[str | None, typer.Option(help="Architect model — drives the main single-shot threat-model judgment. A stronger reasoning model is worth the cost here. Uses saved config if omitted.")] = None,
     architect_api_key: Annotated[str | None, typer.Option(help="Architect API key.")] = None,
-    architect_api_base: Annotated[str | None, typer.Option(help="Architect API base URL.")] = None,
+    architect_api_base: Annotated[str | None, typer.Option(help="Architect API base URL (a Responses-compatible endpoint).")] = None,
     architect_max_tokens: Annotated[int | None, typer.Option(help="Architect per-call output token cap.")] = None,
     no_architect: Annotated[bool, typer.Option("--no-architect", help="Bypass any saved architect tier for this run; worker handles every call.")] = False,
     input_file: Annotated[Path | None, typer.Option("-i", "--input", help="App description file.")] = None,
@@ -901,14 +1251,15 @@ def quick(
             console.print(f"[red]Error: {input_file} not found.[/red]")
             raise typer.Exit(1)
         app_description = input_file.read_text()
-        report_name = input_file.stem
     else:
         console.print("[dim]Reading app description from stdin (Ctrl+D to finish)...[/dim]")
         app_description = sys.stdin.read()
-        report_name = "quick-analysis"
 
     if not app_description.strip():
         console.print("[red]Error: Empty app description.[/red]")
+        raise typer.Exit(1)
+
+    if output is not None and not _prepare_output_dir(output):
         raise typer.Exit(1)
 
     source = str(input_file) if input_file else "stdin"
@@ -923,13 +1274,18 @@ def quick(
     )
 
     started_at = datetime.now(UTC)
-    with console.status("Analysing description..."):
-        result = run_quick_analysis(models, app_description, hint=app_type)
+    try:
+        with console.status("Analysing description..."):
+            result = run_quick_analysis(models, app_description, hint=app_type)
+    except Exception as e:
+        if not _report_provider_failure(e):
+            raise
+        raise typer.Exit(1) from None
     finished_at = datetime.now(UTC)
 
     saved_path = save_quick_report(
         result,
-        report_name,
+        _quick_report_name(input_file),
         app_type_hint=app_type,
         models=models,
     )
@@ -939,9 +1295,9 @@ def quick(
     if output:
         if output_format == OutputFormat.html:
             html = render_html_from_json(load_report(saved_path))
-            output.write_text(html)
+            output.write_text(html, encoding="utf-8")
         else:
-            output.write_text(markdown)
+            output.write_text(markdown, encoding="utf-8")
         console.print(f"[green]Report written to {output}[/green]")
         _persist_quick_intermediates(
             output=output,
@@ -1033,11 +1389,13 @@ def reports(
         rendered = render_html_from_json(data)
 
     if output:
-        output.write_text(rendered)
+        if not _prepare_output_dir(output):
+            raise typer.Exit(1)
+        output.write_text(rendered, encoding="utf-8")
         console.print(f"[green]Report exported to {output}[/green]")
         if output_format == OutputFormat.json:
             html_path = output.with_suffix(".html")
-            html_path.write_text(render_html_from_json(data))
+            html_path.write_text(render_html_from_json(data), encoding="utf-8")
             console.print(f"[green]HTML view written to {html_path}[/green]")
     else:
         console.print()
@@ -1105,16 +1463,20 @@ def _build_model_pair(
     # ---- Worker tier ----
     if worker_model:
         worker_provider, worker_model_name = _resolve_provider(worker_model)
+        # --worker-model can name a provider the saved config knows nothing
+        # about, so the key has to come from that provider, not from whatever
+        # is in config.json. Same rule the architect tier already follows.
+        worker_key = worker_api_key or _resolve_explicit_api_key(worker_provider)
     elif saved:
         worker_provider = saved["worker_provider_key"]
         worker_model_name = saved["worker_model"]
+        worker_key = worker_api_key or get_api_key(saved, tier="worker")
     else:
         console.print("[red]No --worker-model specified and no saved config. Run stride-gpt to set up.[/red]")
         raise typer.Exit(1)
 
-    worker_key = worker_api_key or get_api_key(saved or {}, tier="worker")
-    if not worker_key and worker_provider != "LM Studio Server":
-        console.print("[red]No worker API key found. Set the appropriate env var (e.g. ANTHROPIC_API_KEY) or pass --worker-api-key.[/red]")
+    if not worker_key:
+        console.print(_no_worker_key_message(worker_provider))
         raise typer.Exit(1)
 
     if worker_api_base is None and saved:
@@ -1137,7 +1499,7 @@ def _build_model_pair(
     elif architect_model:
         a_provider, a_model_name = _resolve_provider(architect_model)
         a_key = architect_api_key or _resolve_explicit_api_key(a_provider) or ""
-        if not a_key and a_provider != "LM Studio Server":
+        if not a_key:
             console.print(
                 f"[red]Architect API key for {a_provider} could not be resolved. "
                 f"Set the provider's env var or pass --architect-api-key.[/red]"
@@ -1171,7 +1533,7 @@ def _tier_to_llm_config_from_saved(saved: dict, tier: str):
 
     provider = saved.get(f"{tier}_provider_key", "")
     api_key = get_api_key(saved, tier=tier)
-    if not api_key and provider != "LM Studio Server":
+    if not api_key:
         return None
     return LLMConfig(
         provider=provider,
@@ -1194,31 +1556,34 @@ def _resolve_explicit_api_key(provider: str) -> str:
     return ""
 
 
+def _no_worker_key_message(provider: str) -> str:
+    """Name the variable the user actually needs, not a generic example."""
+    from stride_gpt.config import PROVIDERS
+
+    env_var = next(
+        (i.env_var for i in PROVIDERS.values() if i.provider_key == provider and i.env_var),
+        None,
+    )
+    if env_var:
+        return (
+            f"[red]No worker API key found for {provider}.[/red] "
+            f"Set {env_var}, or pass --worker-api-key."
+        )
+    return (
+        "[red]No worker API key found.[/red] "
+        "Set the provider's env var, or pass --worker-api-key."
+    )
+
+
 def _check_tier_api_keys(saved: dict, models) -> bool:
     """For interactive `_handle_*` paths: verify both tiers have keys when needed."""
-    if models.worker.provider != "LM Studio Server" and not models.worker.api_key:
+    if not models.worker.api_key:
         console.print("[red]Worker API key missing. Set the appropriate env var or run /config.[/red]")
         return False
-    if models.tiered and models.architect.provider != "LM Studio Server" and not models.architect.api_key:
+    if models.tiered and not models.architect.api_key:
         console.print("[red]Architect API key missing. Set the appropriate env var or run /config.[/red]")
         return False
     return True
-
-
-def _check_lm_studio_context_for(saved: dict, models, console_, *, exit_on_fail: bool = False) -> None:
-    """Verify LM Studio context window for any LM Studio tier in `models`."""
-    from stride_gpt.config import check_lm_studio_context
-
-    for cfg in (models.worker, models.architect):
-        if cfg is None:
-            continue
-        if (
-            cfg.provider == "LM Studio Server"
-            and cfg.api_base
-            and not check_lm_studio_context(cfg.api_base, cfg.model_name, console_)
-            and exit_on_fail
-        ):
-            raise typer.Exit(1)
 
 
 def _panel_target_body(target_path, models) -> str:

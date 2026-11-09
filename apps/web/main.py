@@ -16,73 +16,29 @@ import re
 from collections import defaultdict
 from urllib.parse import urlparse
 
-import requests
 import streamlit as st
 import streamlit.components.v1 as components
 import tiktoken
-from attack_tree import (
-    create_attack_tree_prompt,
-    get_attack_tree,
-    get_attack_tree_deepseek,
-    get_attack_tree_groq,
-    get_attack_tree_lm_studio,
-    get_attack_tree_mistral,
-)
+from attack_tree import create_attack_tree_prompt
 from components.drawio_editor import drawio_editor_component
-from dfd import (
-    get_dfd_deepseek,
-    get_dfd_from_image_openai,
-    get_dfd_groq,
-    get_dfd_lm_studio,
-    get_dfd_mistral,
-    get_dfd_openai,
-)
 from dotenv import load_dotenv
-from dread import (
-    create_dread_assessment_prompt,
-    dread_json_to_markdown,
-    get_dread_assessment,
-    get_dread_assessment_deepseek,
-    get_dread_assessment_groq,
-    get_dread_assessment_lm_studio,
-    get_dread_assessment_mistral,
-)
+from dread import create_dread_assessment_prompt, dread_json_to_markdown
 from github import Github, GithubException
-from mitigations import (
-    create_mitigations_prompt,
-    get_mitigations,
-    get_mitigations_deepseek,
-    get_mitigations_groq,
-    get_mitigations_lm_studio,
-    get_mitigations_mistral,
-)
-from openai import OpenAI
-from provider_keys import PROVIDER_API_KEY_STATE
-from test_cases import (
-    create_test_cases_prompt,
-    get_test_cases,
-    get_test_cases_deepseek,
-    get_test_cases_groq,
-    get_test_cases_lm_studio,
-    get_test_cases_mistral,
-)
-from threat_model import (
-    create_image_analysis_prompt,
-    create_threat_model_prompt,
-    get_image_analysis,
-    get_threat_model,
-    get_threat_model_deepseek,
-    get_threat_model_groq,
-    get_threat_model_lm_studio,
-    get_threat_model_mistral,
-    json_to_markdown,
-)
+from mitigations import create_mitigations_prompt
+from provider_keys import PROVIDER_API_KEY_STATE, resolve_active_llm_config
+from test_cases import create_test_cases_prompt
+from threat_model import create_threat_model_prompt, json_to_markdown
 
+from stride_gpt.core.attack_tree import generate_attack_tree
+from stride_gpt.core.dfd import generate_dfd, parse_dfd_from_image
 from stride_gpt.core.drawio_parser import drawio_to_prompt_section
+from stride_gpt.core.dread import generate_dread_assessment
 from stride_gpt.core.json_extract import extract_json_object
 from stride_gpt.core.llm import call_llm
+from stride_gpt.core.mitigations import generate_mitigations
 from stride_gpt.core.prompts import create_dfd_prompt
-from stride_gpt.core.schemas import LLMConfig
+from stride_gpt.core.test_cases import generate_test_cases
+from stride_gpt.core.threat_model import analyze_image, generate_threat_model
 
 # ------------------ Helper Functions ------------------ #
 
@@ -168,39 +124,6 @@ def build_guided_description_draft():
         f"- External integrations: {clean(st.session_state.get('guided_integrations', ''))}",
     ]
     return "\n".join(lines)
-
-
-def resolve_active_llm_config(*, response_format="text"):
-    """Build an LLMConfig for the provider/model/key currently in session state.
-
-    Reads everything from session state so callers outside ``main()`` (e.g. the
-    guided-description builder) can reach the active model. Returns ``None`` when
-    no usable key is available, letting callers fall back gracefully.
-    """
-    provider = st.session_state.get("model_provider", "OpenAI API")
-    model_name = st.session_state.get("selected_model", "")
-    if not model_name:
-        return None
-
-    api_base = None
-    if provider == "LM Studio Server":
-        api_key = st.session_state.get("lm_studio_api_key", "") or "not-needed"
-        api_base = st.session_state.get("lm_studio_endpoint", "http://localhost:1234")
-    else:
-        state_key = PROVIDER_API_KEY_STATE.get(provider)
-        if not state_key:
-            return None
-        api_key = st.session_state.get(state_key, "")
-        if not api_key:
-            return None
-
-    return LLMConfig(
-        provider=provider,
-        model_name=model_name,
-        api_key=api_key,
-        api_base=api_base,
-        response_format=response_format,
-    )
 
 
 def generate_guided_draft(config, app_type, answers):
@@ -370,34 +293,6 @@ def render_guided_description_builder(*, wrap_in_expander=False):
                     "Suggestions are guidance only; they are not added to your "
                     "description automatically."
                 )
-
-
-# Function to get available models from LM Studio Server
-def get_lm_studio_models(endpoint, api_key="not-needed"):
-    try:
-        client = OpenAI(base_url=f"{endpoint}/v1", api_key=api_key)
-        models = client.models.list()
-        return [model.id for model in models.data]
-    except requests.exceptions.ConnectionError:
-        st.error(
-            """Unable to connect to LM Studio Server. Please ensure:
-1. LM Studio is running and the local server is started
-2. The endpoint URL is correct (default: http://localhost:1234)
-3. No firewall is blocking the connection"""
-        )
-        return ["local-model"]
-    except Exception as e:
-        st.error(
-            f"""Error fetching models from LM Studio Server: {e}
-
-Please check:
-1. LM Studio is properly configured and running
-2. You have loaded a model in LM Studio
-3. The server is running in local inference mode
-4. If using authentication, verify your API key is correct"""
-        )
-        return ["local-model"]
-
 
 
 # Function to get user input for the application description and key details
@@ -858,22 +753,6 @@ def load_env_variables():
     if openai_api_key:
         st.session_state["openai_api_key"] = openai_api_key
 
-    mistral_api_key = os.getenv("MISTRAL_API_KEY")
-    if mistral_api_key:
-        st.session_state["mistral_api_key"] = mistral_api_key
-
-    groq_api_key = os.getenv("GROQ_API_KEY")
-    if groq_api_key:
-        st.session_state["groq_api_key"] = groq_api_key
-
-    deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
-    if deepseek_api_key:
-        st.session_state["deepseek_api_key"] = deepseek_api_key
-
-    # Add LM Studio Server endpoint configuration
-    lm_studio_endpoint = os.getenv("LM_STUDIO_ENDPOINT", "http://localhost:1234")
-    st.session_state["lm_studio_endpoint"] = lm_studio_endpoint
-
 
 # Call this function at the start of your app
 load_env_variables()
@@ -902,7 +781,7 @@ def on_model_provider_change():
         st.session_state.selected_model = models[0].model_id
         st.session_state.token_limit = models[0].default_tokens
     else:
-        # LM Studio or unknown — conservative default
+        # Unknown provider — conservative default
         st.session_state.token_limit = 8000
 
     # Reset the current_model_key to force token limit update in Advanced Settings
@@ -944,79 +823,35 @@ with st.sidebar:
         help="Select the model provider you would like to use. This will determine the models available for selection.",
     )
 
-    if model_provider == "LM Studio Server":
-        # --- LM Studio: custom endpoint + dynamic model discovery ---
-        provider_info = _PROVIDERS["LM Studio"]
-        st.markdown(provider_info.setup_instructions)
+    # Find the ProviderInfo by provider_key
+    _current_provider = next(p for p in _PROVIDERS.values() if p.provider_key == model_provider)
+    st.markdown(_current_provider.setup_instructions)
 
-        lm_studio_endpoint = st.text_input(
-            "Enter your LM Studio Server endpoint:",
-            value=st.session_state.get("lm_studio_endpoint", "http://localhost:1234"),
-            help="The URL of your LM Studio Server instance. Default is http://localhost:1234 for local installations.",
-        )
-
-        lm_studio_api_key = st.text_input(
-            "Enter your LM Studio API key (optional):",
-            value=st.session_state.get("lm_studio_api_key", ""),
+    # API key input
+    _session_key = PROVIDER_API_KEY_STATE.get(model_provider, "")
+    if _session_key:
+        _api_key_val = st.text_input(
+            f"Enter your {_current_provider.name} API key:",
+            value=st.session_state.get(_session_key, ""),
             type="password",
-            help="Optional API key for LM Studio Server authentication. Leave empty if your server doesn't require authentication.",
+            help=f"You can find your API key at [{_current_provider.name}]({_current_provider.api_key_url}).",
         )
-        if lm_studio_api_key:
-            st.session_state["lm_studio_api_key"] = lm_studio_api_key
+        if _api_key_val:
+            st.session_state[_session_key] = _api_key_val
 
-        if lm_studio_endpoint:
-            if not lm_studio_endpoint.startswith(("http://", "https://")):
-                st.error("Endpoint URL must start with http:// or https://")
-            else:
-                st.session_state["lm_studio_endpoint"] = lm_studio_endpoint
-                available_models = get_lm_studio_models(
-                    lm_studio_endpoint, st.session_state.get("lm_studio_api_key", "")
-                )
-
-        # Not assigned: the widget's `key` writes to st.session_state, and the
-        # value is read back from there further down. The old local was dead --
-        # reassigned from session state before anything read it.
-        st.selectbox(
-            "Select the model you would like to use:",
-            (
-                available_models
-                if lm_studio_endpoint and lm_studio_endpoint.startswith(("http://", "https://"))
-                else ["local-model"]
-            ),
-            key="selected_model",
-            on_change=on_model_selection_change,
-            help="Select a model from your local LM Studio Server. If you don't see any models, make sure LM Studio Server is running with models loaded.",
-        )
-    else:
-        # --- Cloud providers: generic rendering from registry ---
-        # Find the ProviderInfo by provider_key
-        _current_provider = next(p for p in _PROVIDERS.values() if p.provider_key == model_provider)
-        st.markdown(_current_provider.setup_instructions)
-
-        # API key input
-        _session_key = PROVIDER_API_KEY_STATE.get(model_provider, "")
-        if _session_key:
-            _api_key_val = st.text_input(
-                f"Enter your {_current_provider.name} API key:",
-                value=st.session_state.get(_session_key, ""),
-                type="password",
-                help=f"You can find your API key at [{_current_provider.name}]({_current_provider.api_key_url}).",
-            )
-            if _api_key_val:
-                st.session_state[_session_key] = _api_key_val
-
-        # Model selectbox from registry
-        _model_list = get_models_for_provider(model_provider)
-        _model_ids = [m.model_id for m in _model_list]
-        _model_help = " | ".join(f"{m.model_id}: {m.help_text}" for m in _model_list if m.help_text)
-        # Not assigned, for the same reason as the LM Studio selectbox above.
-        st.selectbox(
-            "Select the model you would like to use:",
-            _model_ids,
-            key="selected_model",
-            on_change=on_model_selection_change,
-            help=_model_help or None,
-        )
+    # Model selectbox from registry
+    _model_list = get_models_for_provider(model_provider)
+    _model_ids = [m.model_id for m in _model_list]
+    _model_help = " | ".join(f"{m.model_id}: {m.help_text}" for m in _model_list if m.help_text)
+    # Not assigned: the widget's `key` writes to st.session_state, and the
+    # value is read back from there further down.
+    st.selectbox(
+        "Select the model you would like to use:",
+        _model_ids,
+        key="selected_model",
+        on_change=on_model_selection_change,
+        help=_model_help or None,
+    )
 
     # Add GitHub API key input field to the sidebar
     github_api_key = st.text_input(
@@ -1119,7 +954,7 @@ with st.sidebar:
     st.markdown(
         """
     ### **How does STRIDE GPT work?**
-    When you enter an application description and other relevant details, the tool uses advanced AI models from multiple providers (OpenAI, Mistral, Groq, DeepSeek, and LM Studio) to generate a threat model for your application. The selected model analyzes the application description and details to generate a list of potential threats and then categorises each threat according to the STRIDE methodology.
+    When you enter an application description and other relevant details, the tool uses advanced OpenAI models to generate a threat model for your application. The selected model analyzes the application description and details to generate a list of potential threats and then categorises each threat according to the STRIDE methodology.
     """
     )
     st.markdown(
@@ -1152,21 +987,6 @@ with st.sidebar:
     You can improve the accuracy of the threat models by providing a detailed description of the application and selecting the correct application type, authentication methods, and other relevant details. The more information you provide, the more accurate the threat models will be.
     """
     )
-
-
-# ------------------ Provider API keys (module scope) ------------------ #
-#
-# `load_env_variables()` reads .env into FUNCTION-LOCAL variables, and the
-# sidebar's password fields only write to st.session_state — neither path
-# defines `openai_api_key` / `mistral_api_key` / etc. at module scope.
-# Hoist them here, after the sidebar has run, so the bare names referenced
-# throughout the tab bodies (image analysis, threat model, attack tree,
-# mitigations, DREAD, test cases) resolve to the live values. Streamlit's
-# hot-reload was masking this by leaking stale locals across reruns.
-openai_api_key = st.session_state.get("openai_api_key", "")
-mistral_api_key = st.session_state.get("mistral_api_key", "")
-groq_api_key = st.session_state.get("groq_api_key", "")
-deepseek_api_key = st.session_state.get("deepseek_api_key", "")
 
 
 # ------------------ Main App UI ------------------ #
@@ -1275,33 +1095,34 @@ understanding possible vulnerabilities and attack vectors. Use this tab to gener
                         return base64.b64encode(uploaded_file.read()).decode("utf-8")
 
                     base64_image = encode_image(uploaded_file)
-                    image_analysis_prompt = create_image_analysis_prompt()
 
-                    try:
-                        if not openai_api_key:
-                            st.error("Please enter your OpenAI API key to analyse the image.")
-                            raise ValueError
-                        image_analysis_output = get_image_analysis(
-                            openai_api_key, selected_model, image_analysis_prompt, base64_image
-                        )
+                    # Determine media type from file extension
+                    file_type = uploaded_file.type
+                    if file_type == "image/png":
+                        media_type = "image/png"
+                    elif file_type in ["image/jpeg", "image/jpg"]:
+                        media_type = "image/jpeg"
+                    else:
+                        media_type = "image/jpeg"  # Default fallback
 
-                        if (
-                            image_analysis_output
-                            and "choices" in image_analysis_output
-                            and image_analysis_output["choices"][0]["message"]["content"]
-                        ):
-                            image_analysis_content = image_analysis_output["choices"][0][
-                                "message"
-                            ]["content"]
-                            st.session_state.image_analysis_content = image_analysis_content
-                            st.session_state["app_input"] = image_analysis_content
-                            st.session_state["_sync_app_desc"] = True
-                        else:
-                            st.error(
-                                "Failed to analyze the image. Please check the API key and try again."
-                            )
-                    except Exception as e:
-                        st.error(f"An error occurred while analyzing the image: {e!s}")
+                    config = resolve_active_llm_config()
+                    if config is None:
+                        st.error(f"Please enter your {model_provider} key to analyse the image.")
+                    else:
+                        try:
+                            image_analysis_content = analyze_image(
+                                config, base64_image, media_type=media_type
+                            ).content
+                            if image_analysis_content:
+                                st.session_state.image_analysis_content = image_analysis_content
+                                st.session_state["app_input"] = image_analysis_content
+                                st.session_state["_sync_app_desc"] = True
+                            else:
+                                st.error(
+                                    "Failed to analyze the image. Please check the API key and try again."
+                                )
+                        except Exception as e:
+                            st.error(f"An error occurred while analyzing the image: {e!s}")
 
         with _draw_tab:
             if st.button("Open Diagram Editor", key="toggle_drawio", use_container_width=True):
@@ -1428,60 +1249,50 @@ understanding possible vulnerabilities and attack vectors. Use this tab to gener
             confirmed_dfd=st.session_state.get("confirmed_dfd"),
         )
 
-        # Show a spinner while generating the threat model
-        with st.spinner("Analysing potential threats..."):
-            max_retries = 3
-            retry_count = 0
-            while retry_count < max_retries:
-                try:
-                    # Call the relevant get_threat_model function with the generated prompt
-                    if model_provider == "OpenAI API":
-                        model_output = get_threat_model(
-                            openai_api_key, selected_model, threat_model_prompt
-                        )
-                    elif model_provider == "Mistral API":
-                        model_output = get_threat_model_mistral(
-                            mistral_api_key, selected_model, threat_model_prompt
-                        )
-                    elif model_provider == "LM Studio Server":
-                        model_output = get_threat_model_lm_studio(
-                            st.session_state["lm_studio_endpoint"],
-                            selected_model,
-                            threat_model_prompt,
-                            st.session_state.get("lm_studio_api_key", ""),
-                        )
-                    elif model_provider == "Groq API":
-                        model_output = get_threat_model_groq(
-                            groq_api_key, selected_model, threat_model_prompt
-                        )
-                    elif model_provider == "DeepSeek API":
-                        model_output = get_threat_model_deepseek(
-                            deepseek_api_key, selected_model, threat_model_prompt
-                        )
+        config = resolve_active_llm_config()
+        if config is None:
+            st.error(f"Please enter your {model_provider} key and choose a model in the sidebar.")
+        else:
+            # Show a spinner while generating the threat model
+            with st.spinner("Analysing potential threats..."):
+                max_retries = 3
+                retry_count = 0
+                while retry_count < max_retries:
+                    try:
+                        result, _response = generate_threat_model(config, threat_model_prompt)
+                        threat_model = result.threat_model
+                        improvement_suggestions = result.improvement_suggestions
+                        # Check if we got a fallback response
+                        if (
+                            len(threat_model) == 1
+                            and threat_model[0].get("Threat Type") == "Error"
+                        ):
+                            st.warning(
+                                "⚠️ There was an issue generating the threat model. The model may have returned a response in an unexpected format. You can try:"
+                            )
+                            st.markdown("1. Running the generation again")
+                            st.markdown("2. Checking the application logs for more details")
+                            st.markdown("3. Using a different model if the issue persists")
 
-                    # Access the threat model and improvement suggestions from the parsed content
-                    threat_model = model_output.get("threat_model", [])
-                    improvement_suggestions = model_output.get("improvement_suggestions", [])
+                        # Save the threat model and suggestions to session state for later use
+                        st.session_state["threat_model"] = threat_model
+                        st.session_state["improvement_suggestions"] = improvement_suggestions
 
-                    # Save the threat model and suggestions to session state for later use
-                    st.session_state["threat_model"] = threat_model
-                    st.session_state["improvement_suggestions"] = improvement_suggestions
-
-                    # Convert to Markdown and store in session state for persistent display
-                    st.session_state["threat_model_markdown"] = json_to_markdown(
-                        threat_model, improvement_suggestions
-                    )
-                    break  # Exit the loop if successful
-                except Exception as e:
-                    retry_count += 1
-                    if retry_count == max_retries:
-                        st.error(f"Error generating threat model after {max_retries} attempts: {e}")
-                        threat_model = []
-                        improvement_suggestions = []
-                    else:
-                        st.warning(
-                            f"Error generating threat model. Retrying attempt {retry_count + 1}/{max_retries}..."
+                        # Convert to Markdown and store in session state for persistent display
+                        st.session_state["threat_model_markdown"] = json_to_markdown(
+                            threat_model, improvement_suggestions
                         )
+                        break  # Exit the loop if successful
+                    except Exception as e:
+                        retry_count += 1
+                        if retry_count == max_retries:
+                            st.error(f"Error generating threat model after {max_retries} attempts: {e}")
+                            threat_model = []
+                            improvement_suggestions = []
+                        else:
+                            st.warning(
+                                f"Error generating threat model. Retrying attempt {retry_count + 1}/{max_retries}..."
+                            )
 
 # Display threat model output on tab1 (must be in tab1 context to only show on that tab)
 with tab1:
@@ -1514,62 +1325,33 @@ vulnerabilities and prioritising mitigation efforts.
 """
     )
     st.markdown("""---""")
-    if model_provider == "Mistral API" and selected_model == "mistral-small-2506":
-        st.warning(
-            "⚠️ Mistral Small doesn't reliably generate syntactically correct Mermaid code. Please use Mistral Large for generating attack trees, or select a different model provider."
+    # Create a submit button for Attack Tree
+    attack_tree_submit_button = st.button(label="Generate Attack Tree")
+
+    # If the Generate Attack Tree button is clicked and the user has provided an application description
+    if attack_tree_submit_button and st.session_state.get("app_input"):
+        app_input = st.session_state.get("app_input")
+
+        # Generate the prompt using the create_attack_tree_prompt function.
+        # When a DFD has been confirmed on the Data Flow Diagram tab it
+        # is appended so the attack paths reference the same components.
+        attack_tree_prompt = create_attack_tree_prompt(
+            app_type,
+            authentication,
+            internet_facing,
+            sensitive_data,
+            app_input,
+            confirmed_dfd=st.session_state.get("confirmed_dfd"),
         )
-    else:
-        if model_provider == "LM Studio Server":
-            st.warning(
-                "⚠️ Users may encounter syntax errors when generating attack trees using local LLMs. Experiment with different local LLMs to assess their output quality, or consider using a hosted model provider to generate attack trees."
-            )
 
-        # Create a submit button for Attack Tree
-        attack_tree_submit_button = st.button(label="Generate Attack Tree")
-
-        # If the Generate Attack Tree button is clicked and the user has provided an application description
-        if attack_tree_submit_button and st.session_state.get("app_input"):
-            app_input = st.session_state.get("app_input")
-
-            # Generate the prompt using the create_attack_tree_prompt function.
-            # When a DFD has been confirmed on the Data Flow Diagram tab it
-            # is appended so the attack paths reference the same components.
-            attack_tree_prompt = create_attack_tree_prompt(
-                app_type,
-                authentication,
-                internet_facing,
-                sensitive_data,
-                app_input,
-                confirmed_dfd=st.session_state.get("confirmed_dfd"),
-            )
-
+        config = resolve_active_llm_config()
+        if config is None:
+            st.error(f"Please enter your {model_provider} key and choose a model in the sidebar.")
+        else:
             # Show a spinner while generating the attack tree
             with st.spinner("Generating attack tree..."):
                 try:
-                    # Call the relevant get_attack_tree function with the generated prompt
-                    if model_provider == "OpenAI API":
-                        mermaid_code = get_attack_tree(
-                            openai_api_key, selected_model, attack_tree_prompt
-                        )
-                    elif model_provider == "Mistral API":
-                        mermaid_code = get_attack_tree_mistral(
-                            mistral_api_key, selected_model, attack_tree_prompt
-                        )
-                    elif model_provider == "LM Studio Server":
-                        mermaid_code = get_attack_tree_lm_studio(
-                            st.session_state["lm_studio_endpoint"],
-                            selected_model,
-                            attack_tree_prompt,
-                            st.session_state.get("lm_studio_api_key", ""),
-                        )
-                    elif model_provider == "Groq API":
-                        mermaid_code = get_attack_tree_groq(
-                            groq_api_key, selected_model, attack_tree_prompt
-                        )
-                    elif model_provider == "DeepSeek API":
-                        mermaid_code = get_attack_tree_deepseek(
-                            deepseek_api_key, selected_model, attack_tree_prompt
-                        )
+                    mermaid_code, _response = generate_attack_tree(config, attack_tree_prompt)
 
                     # Display the generated attack tree code
                     st.write("Attack Tree Code:")
@@ -1667,14 +1449,7 @@ Three ways to use this tab:
 
     # --- Section 2: Handle Generation --- #
 
-    # API keys live in st.session_state once the sidebar has run (loaded from
-    # .env in load_env_variables and/or typed into the password field). The
-    # bare names openai_api_key / mistral_api_key etc. are only ever local
-    # to load_env_variables, so always go through session_state here.
-    _dfd_api_key = st.session_state.get(
-        PROVIDER_API_KEY_STATE.get(model_provider, ""),
-        "",
-    )
+    _dfd_config = resolve_active_llm_config()
 
     if dfd_generate_button and st.session_state.get("app_input"):
         dfd_prompt = create_dfd_prompt(
@@ -1684,7 +1459,7 @@ Three ways to use this tab:
             sensitive_data,
             st.session_state["app_input"],
         )
-        if model_provider != "LM Studio Server" and not _dfd_api_key:
+        if _dfd_config is None:
             st.error(
                 f"Please enter your {model_provider} key in the sidebar (or set it in "
                 "your .env file) before generating a DFD."
@@ -1692,23 +1467,7 @@ Three ways to use this tab:
         else:
             with st.spinner("Generating Data Flow Diagram..."):
                 try:
-                    if model_provider == "OpenAI API":
-                        dfd_mermaid = get_dfd_openai(_dfd_api_key, selected_model, dfd_prompt)
-                    elif model_provider == "Mistral API":
-                        dfd_mermaid = get_dfd_mistral(_dfd_api_key, selected_model, dfd_prompt)
-                    elif model_provider == "Groq API":
-                        dfd_mermaid = get_dfd_groq(_dfd_api_key, selected_model, dfd_prompt)
-                    elif model_provider == "DeepSeek API":
-                        dfd_mermaid = get_dfd_deepseek(_dfd_api_key, selected_model, dfd_prompt)
-                    elif model_provider == "LM Studio Server":
-                        dfd_mermaid = get_dfd_lm_studio(
-                            st.session_state["lm_studio_endpoint"],
-                            selected_model,
-                            dfd_prompt,
-                            st.session_state.get("lm_studio_api_key", ""),
-                        )
-                    else:
-                        dfd_mermaid = ""
+                    dfd_mermaid, _response = generate_dfd(_dfd_config, dfd_prompt)
                     # Generation invalidates any previous confirmation — the user
                     # needs to re-tick "Use this DFD" to opt back in.
                     st.session_state["dfd_mermaid"] = dfd_mermaid
@@ -1725,7 +1484,7 @@ Three ways to use this tab:
         # the same object across reruns, so we key on the file name + size.
         upload_key = f"{uploaded_dfd_image.name}:{uploaded_dfd_image.size}"
         if st.session_state.get("dfd_last_upload_key") != upload_key:
-            if not _dfd_api_key:
+            if _dfd_config is None:
                 st.error(
                     f"Please enter your {model_provider} key in the sidebar before "
                     "uploading a DFD image."
@@ -1735,8 +1494,11 @@ Three ways to use this tab:
                     try:
                         image_bytes = uploaded_dfd_image.read()
                         base64_image = base64.b64encode(image_bytes).decode("utf-8")
-                        dfd_mermaid = get_dfd_from_image_openai(
-                            _dfd_api_key, selected_model, base64_image
+                        media_type = (
+                            "image/png" if uploaded_dfd_image.type == "image/png" else "image/jpeg"
+                        )
+                        dfd_mermaid, _response = parse_dfd_from_image(
+                            _dfd_config, base64_image, media_type=media_type
                         )
                         st.session_state["dfd_mermaid"] = dfd_mermaid
                         st.session_state["dfd_last_upload_key"] = upload_key
@@ -1748,16 +1510,23 @@ Three ways to use this tab:
 
     st.markdown("---")
     st.markdown("**Mermaid source** (edit freely — the preview updates on rerun):")
+
+    def _sync_dfd_from_editor():
+        st.session_state["dfd_mermaid"] = st.session_state["dfd_editor"]
+
+    # A keyed text_area ignores value= after its first render, so a DFD from
+    # generation or an image upload has to be copied into the editor's state.
+    # User edits reach dfd_mermaid through on_change before this check runs.
+    if st.session_state.get("dfd_editor") != st.session_state.get("dfd_mermaid", ""):
+        st.session_state["dfd_editor"] = st.session_state.get("dfd_mermaid", "")
     dfd_editor_value = st.text_area(
         "DFD Mermaid code",
-        value=st.session_state.get("dfd_mermaid", ""),
         height=260,
         key="dfd_editor",
+        on_change=_sync_dfd_from_editor,
         label_visibility="collapsed",
         placeholder="No DFD yet. Use 'Generate DFD' or upload an image to populate this editor.",
     )
-    # Keep dfd_mermaid in sync with the editor so it survives reruns.
-    st.session_state["dfd_mermaid"] = dfd_editor_value
 
     if dfd_editor_value.strip():
         st.markdown("**Diagram preview:**")
@@ -1831,64 +1600,45 @@ the security posture of the application and protect against potential attacks.
             # Generate the prompt using the create_mitigations_prompt function
             mitigations_prompt = create_mitigations_prompt(threats_markdown, is_genai=is_genai, is_agentic=is_agentic)
 
-            # Show a spinner while suggesting mitigations
-            with st.spinner("Suggesting mitigations..."):
-                max_retries = 3
-                retry_count = 0
-                while retry_count < max_retries:
-                    try:
-                        # Call the relevant get_mitigations function with the generated prompt
-                        if model_provider == "OpenAI API":
-                            mitigations_markdown = get_mitigations(
-                                openai_api_key, selected_model, mitigations_prompt
-                            )
-                        elif model_provider == "Mistral API":
-                            mitigations_markdown = get_mitigations_mistral(
-                                mistral_api_key, selected_model, mitigations_prompt
-                            )
-                        elif model_provider == "LM Studio Server":
-                            mitigations_markdown = get_mitigations_lm_studio(
-                                st.session_state["lm_studio_endpoint"],
-                                selected_model,
-                                mitigations_prompt,
-                                st.session_state.get("lm_studio_api_key", ""),
-                            )
-                        elif model_provider == "Groq API":
-                            mitigations_markdown = get_mitigations_groq(
-                                groq_api_key, selected_model, mitigations_prompt
-                            )
-                        elif model_provider == "DeepSeek API":
-                            mitigations_markdown = get_mitigations_deepseek(
-                                deepseek_api_key, selected_model, mitigations_prompt
+            config = resolve_active_llm_config()
+            if config is None:
+                st.error(f"Please enter your {model_provider} key and choose a model in the sidebar.")
+            else:
+                # Show a spinner while suggesting mitigations
+                with st.spinner("Suggesting mitigations..."):
+                    max_retries = 3
+                    retry_count = 0
+                    while retry_count < max_retries:
+                        try:
+                            mitigations_markdown, _response = generate_mitigations(config, mitigations_prompt)
+
+                            # Display the suggested mitigations in Markdown
+                            st.markdown(mitigations_markdown)
+
+                            st.markdown("")
+
+                            # Add a button to allow the user to download the mitigations as a Markdown file
+                            st.download_button(
+                                label="Download Mitigations",
+                                data=mitigations_markdown,
+                                file_name="mitigations.md",
+                                mime="text/markdown",
                             )
 
-                        # Display the suggested mitigations in Markdown
-                        st.markdown(mitigations_markdown)
+                            break  # Exit the loop if successful
+                        except Exception as e:
+                            retry_count += 1
+                            if retry_count == max_retries:
+                                st.error(
+                                    f"Error suggesting mitigations after {max_retries} attempts: {e}"
+                                )
+                                mitigations_markdown = ""
+                            else:
+                                st.warning(
+                                    f"Error suggesting mitigations. Retrying attempt {retry_count + 1}/{max_retries}..."
+                                )
 
-                        st.markdown("")
-
-                        # Add a button to allow the user to download the mitigations as a Markdown file
-                        st.download_button(
-                            label="Download Mitigations",
-                            data=mitigations_markdown,
-                            file_name="mitigations.md",
-                            mime="text/markdown",
-                        )
-
-                        break  # Exit the loop if successful
-                    except Exception as e:
-                        retry_count += 1
-                        if retry_count == max_retries:
-                            st.error(
-                                f"Error suggesting mitigations after {max_retries} attempts: {e}"
-                            )
-                            mitigations_markdown = ""
-                        else:
-                            st.warning(
-                                f"Error suggesting mitigations. Retrying attempt {retry_count + 1}/{max_retries}..."
-                            )
-
-            st.markdown("")
+                st.markdown("")
         else:
             st.error("Please generate a threat model first before suggesting mitigations.")
 
@@ -1917,80 +1667,61 @@ focusing on the most critical threats first. Use this tab to perform a DREAD ris
             is_agentic = app_type == "Agentic AI application"
             # Generate the prompt using the create_dread_assessment_prompt function
             dread_assessment_prompt = create_dread_assessment_prompt(threats_markdown, is_genai=is_genai, is_agentic=is_agentic)
-            # Show a spinner while generating DREAD Risk Assessment
-            with st.spinner("Generating DREAD Risk Assessment..."):
-                max_retries = 3
-                retry_count = 0
-                while retry_count < max_retries:
-                    try:
-                        # Call the relevant get_dread_assessment function with the generated prompt
-                        if model_provider == "OpenAI API":
-                            dread_assessment = get_dread_assessment(
-                                openai_api_key, selected_model, dread_assessment_prompt
-                            )
-                        elif model_provider == "Mistral API":
-                            dread_assessment = get_dread_assessment_mistral(
-                                mistral_api_key, selected_model, dread_assessment_prompt
-                            )
-                        elif model_provider == "LM Studio Server":
-                            dread_assessment = get_dread_assessment_lm_studio(
-                                st.session_state["lm_studio_endpoint"],
-                                selected_model,
-                                dread_assessment_prompt,
-                                st.session_state.get("lm_studio_api_key", ""),
-                            )
-                        elif model_provider == "Groq API":
-                            dread_assessment = get_dread_assessment_groq(
-                                groq_api_key, selected_model, dread_assessment_prompt
-                            )
-                        elif model_provider == "DeepSeek API":
-                            dread_assessment = get_dread_assessment_deepseek(
-                                deepseek_api_key, selected_model, dread_assessment_prompt
-                            )
+            config = resolve_active_llm_config()
+            if config is None:
+                st.error(f"Please enter your {model_provider} key and choose a model in the sidebar.")
+            else:
+                # Show a spinner while generating DREAD Risk Assessment
+                with st.spinner("Generating DREAD Risk Assessment..."):
+                    max_retries = 3
+                    retry_count = 0
+                    while retry_count < max_retries:
+                        try:
+                            dread_assessment, _response = generate_dread_assessment(config, dread_assessment_prompt)
 
-                        # Save the DREAD assessment to the session state for later use in test cases
-                        st.session_state["dread_assessment"] = dread_assessment
-                        break  # Exit the loop if successful
-                    except Exception as e:
-                        retry_count += 1
-                        if retry_count == max_retries:
-                            st.error(
-                                f"Error generating DREAD risk assessment after {max_retries} attempts: {e}"
-                            )
-                            dread_assessment = {"Risk Assessment": []}
-                            # Add debug information
-                            st.error(
-                                "Debug: No threats were found in the response. Please try generating the threat model again."
-                            )
-                        else:
-                            st.warning(
-                                f"Error generating DREAD risk assessment. Retrying attempt {retry_count + 1}/{max_retries}..."
-                            )
-            # Convert the DREAD assessment JSON to Markdown
-            dread_assessment_markdown = dread_json_to_markdown(dread_assessment)
+                            # Save the DREAD assessment to the session state for later use in test cases
+                            st.session_state["dread_assessment"] = dread_assessment
+                            break  # Exit the loop if successful
+                        except Exception as e:
+                            retry_count += 1
+                            if retry_count == max_retries:
+                                st.error(
+                                    f"Error generating DREAD risk assessment after {max_retries} attempts: {e}"
+                                )
+                                dread_assessment = {"Risk Assessment": []}
+                                # Add debug information
+                                st.error(
+                                    "Debug: No threats were found in the response. Please try generating the threat model again."
+                                )
+                            else:
+                                st.warning(
+                                    f"Error generating DREAD risk assessment. Retrying attempt {retry_count + 1}/{max_retries}..."
+                                )
+                # Convert the DREAD assessment JSON to Markdown
+                dread_assessment_markdown = dread_json_to_markdown(dread_assessment)
 
-            # Add debug information about the assessment
-            if not dread_assessment.get("Risk Assessment"):
-                st.warning(
-                    "Debug: The DREAD assessment response is empty. Please ensure you have generated a threat model first."
+                # Add debug information about the assessment
+                if not dread_assessment.get("Risk Assessment"):
+                    st.warning(
+                        "Debug: The DREAD assessment response is empty. Please ensure you have generated a threat model first."
+                    )
+
+                # Display the DREAD assessment with a header
+                st.markdown("## DREAD Risk Assessment")
+                st.markdown(
+                    "The table below shows the DREAD risk assessment for each identified threat. The Risk Score is calculated as the average of the five DREAD categories."
                 )
 
-            # Display the DREAD assessment with a header
-            st.markdown("## DREAD Risk Assessment")
-            st.markdown(
-                "The table below shows the DREAD risk assessment for each identified threat. The Risk Score is calculated as the average of the five DREAD categories."
-            )
+                # Display the DREAD assessment in Markdown format
+                st.markdown(dread_assessment_markdown, unsafe_allow_html=False)
 
-            # Display the DREAD assessment in Markdown format
-            st.markdown(dread_assessment_markdown, unsafe_allow_html=False)
-
-            # Add a button to allow the user to download the DREAD assessment as a Markdown file
-            st.download_button(
-                label="Download DREAD Risk Assessment",
-                data=dread_assessment_markdown,
-                file_name="dread_assessment.md",
-                mime="text/markdown",
-            )
+                # Add a button to allow the user to download the DREAD assessment as a Markdown file
+                st.download_button(
+                    label="Download DREAD Risk Assessment",
+                    data=dread_assessment_markdown,
+                    file_name="dread_assessment.md",
+                    mime="text/markdown",
+                )
         else:
             st.error(
                 "Please generate a threat model first before requesting a DREAD risk assessment."
@@ -2026,64 +1757,45 @@ scenarios.
             # Generate the prompt using the create_test_cases_prompt function
             test_cases_prompt = create_test_cases_prompt(threats_markdown, is_genai=is_genai, is_agentic=is_agentic)
 
-            # Show a spinner while generating test cases
-            with st.spinner("Generating test cases..."):
-                max_retries = 3
-                retry_count = 0
-                while retry_count < max_retries:
-                    try:
-                        # Call to the relevant get_test_cases function with the generated prompt
-                        if model_provider == "OpenAI API":
-                            test_cases_markdown = get_test_cases(
-                                openai_api_key, selected_model, test_cases_prompt
-                            )
-                        elif model_provider == "Mistral API":
-                            test_cases_markdown = get_test_cases_mistral(
-                                mistral_api_key, selected_model, test_cases_prompt
-                            )
-                        elif model_provider == "LM Studio Server":
-                            test_cases_markdown = get_test_cases_lm_studio(
-                                st.session_state["lm_studio_endpoint"],
-                                selected_model,
-                                test_cases_prompt,
-                                st.session_state.get("lm_studio_api_key", ""),
-                            )
-                        elif model_provider == "Groq API":
-                            test_cases_markdown = get_test_cases_groq(
-                                groq_api_key, selected_model, test_cases_prompt
-                            )
-                        elif model_provider == "DeepSeek API":
-                            test_cases_markdown = get_test_cases_deepseek(
-                                deepseek_api_key, selected_model, test_cases_prompt
+            config = resolve_active_llm_config()
+            if config is None:
+                st.error(f"Please enter your {model_provider} key and choose a model in the sidebar.")
+            else:
+                # Show a spinner while generating test cases
+                with st.spinner("Generating test cases..."):
+                    max_retries = 3
+                    retry_count = 0
+                    while retry_count < max_retries:
+                        try:
+                            test_cases_markdown, _response = generate_test_cases(config, test_cases_prompt)
+
+                            # Display the suggested mitigations in Markdown
+                            st.markdown(test_cases_markdown)
+
+                            st.markdown("")
+
+                            # Add a button to allow the user to download the test cases as a Markdown file
+                            st.download_button(
+                                label="Download Test Cases",
+                                data=test_cases_markdown,
+                                file_name="test_cases.md",
+                                mime="text/markdown",
                             )
 
-                        # Display the suggested mitigations in Markdown
-                        st.markdown(test_cases_markdown)
+                            break  # Exit the loop if successful
+                        except Exception as e:
+                            retry_count += 1
+                            if retry_count == max_retries:
+                                st.error(
+                                    f"Error generating test cases after {max_retries} attempts: {e}"
+                                )
+                                test_cases_markdown = ""
+                            else:
+                                st.warning(
+                                    f"Error generating test cases. Retrying attempt {retry_count + 1}/{max_retries}..."
+                                )
 
-                        st.markdown("")
-
-                        # Add a button to allow the user to download the test cases as a Markdown file
-                        st.download_button(
-                            label="Download Test Cases",
-                            data=test_cases_markdown,
-                            file_name="test_cases.md",
-                            mime="text/markdown",
-                        )
-
-                        break  # Exit the loop if successful
-                    except Exception as e:
-                        retry_count += 1
-                        if retry_count == max_retries:
-                            st.error(
-                                f"Error generating test cases after {max_retries} attempts: {e}"
-                            )
-                            test_cases_markdown = ""
-                        else:
-                            st.warning(
-                                f"Error generating test cases. Retrying attempt {retry_count + 1}/{max_retries}..."
-                            )
-
-            st.markdown("")
+                st.markdown("")
 
         else:
             st.error("Please generate a threat model first before requesting test cases.")

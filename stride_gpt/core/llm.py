@@ -1,28 +1,16 @@
-"""Unified LLM interface.
+"""Unified LLM interface: the OpenAI SDK against the Responses API.
 
-OpenAI uses the native Responses API. Groq, DeepSeek, Mistral, and LM Studio
-use the OpenAI SDK against Chat Completions-compatible endpoints.
+Agent history stays in Chat Completions shape and is converted at this boundary.
 """
 
 from __future__ import annotations
 
 import json as _json
-import re
 
 from openai import OpenAI
 
-from stride_gpt.core.mermaid_utils import extract_mermaid_code
 from stride_gpt.core.schemas import LLMConfig, LLMResponse, ToolCallResult
-from stride_gpt.models import (
-    get_model,
-    get_provider_by_key,
-    model_uses_completion_tokens,
-    provider_uses_responses,
-)
-
-# Local OpenAI-compatible servers (LM Studio) ignore the key, but the OpenAI SDK
-# refuses to construct a client without one. Matches apps/web's convention.
-LOCAL_PLACEHOLDER_API_KEY = "not-needed"
+from stride_gpt.models import get_model, get_provider_by_key, model_uses_completion_tokens
 
 
 def _default_output_tokens(config: LLMConfig, fallback: int) -> int:
@@ -37,18 +25,14 @@ def _default_output_tokens(config: LLMConfig, fallback: int) -> int:
 
 def call_llm(config: LLMConfig, messages: list[dict]) -> LLMResponse:
     """Call an LLM with the given messages."""
-    if provider_uses_responses(config.provider):
-        return _call_responses(config, messages)
-    return _call_chat_completions(config, messages)
+    return _call_responses(config, messages)
 
 
 def call_llm_with_tools(
     config: LLMConfig, messages: list[dict], tools: list[dict]
 ) -> LLMResponse:
     """Call an LLM with tool definitions. Returns response with optional tool_calls."""
-    if provider_uses_responses(config.provider):
-        return _call_responses(config, messages, tools=tools)
-    return _call_chat_completions(config, messages, tools=tools)
+    return _call_responses(config, messages, tools=tools)
 
 
 def call_llm_with_image(
@@ -58,10 +42,7 @@ def call_llm_with_image(
     media_type: str = "image/jpeg",
 ) -> LLMResponse:
     """Call an LLM with an image for analysis."""
-    messages = _image_messages(config, prompt, base64_image, media_type)
-    if provider_uses_responses(config.provider):
-        return _call_responses(config, messages)
-    return _call_chat_completions(config, messages)
+    return _call_responses(config, _image_messages(config, prompt, base64_image, media_type))
 
 
 # ---------------------------------------------------------------------------
@@ -70,36 +51,28 @@ def call_llm_with_image(
 
 
 def _client_kwargs(config: LLMConfig) -> dict:
-    """Kwargs for OpenAI() — api_key, base_url, retries, timeout."""
-    provider_info = get_provider_by_key(config.provider)
-    api_key = config.api_key or None
-    if api_key is None and provider_info is not None and not provider_info.needs_api_key:
-        api_key = LOCAL_PLACEHOLDER_API_KEY
+    """Kwargs for OpenAI() -- api_key, base_url, retries, timeout.
 
+    A saved config can still name a provider this build dropped. Refuse it here
+    rather than send that request, and possibly that key, to the wrong service.
+    """
+    if get_provider_by_key(config.provider) is None:
+        raise ValueError(
+            f"Unsupported provider {config.provider!r}: only OpenAI is available. "
+            "Run /config to choose an OpenAI model."
+        )
+    # The SDK retries 408, 429, 5xx and dropped connections with exponential
+    # backoff, and honours Retry-After. The agent loop bursts many calls in
+    # close succession and easily trips TPM caps on tight org tiers.
     kwargs: dict = {
-        "api_key": api_key,
+        "api_key": config.api_key or None,
         "max_retries": 3,
     }
     if config.timeout:
         kwargs["timeout"] = config.timeout
-
-    base_url = _base_url(config)
-    if base_url:
-        kwargs["base_url"] = base_url
-    return kwargs
-
-
-def _base_url(config: LLMConfig) -> str | None:
-    """Resolve the OpenAI-SDK base_url, or None for the default OpenAI host."""
     if config.api_base:
-        base = config.api_base.rstrip("/")
-        if config.provider == "LM Studio Server" and not base.endswith("/v1"):
-            return f"{base}/v1"
-        return base
-    provider_info = get_provider_by_key(config.provider)
-    if provider_info is not None and provider_info.chat_api_base:
-        return provider_info.chat_api_base
-    return None
+        kwargs["base_url"] = config.api_base.rstrip("/")
+    return kwargs
 
 
 def _openai_client(config: LLMConfig) -> OpenAI:
@@ -107,21 +80,8 @@ def _openai_client(config: LLMConfig) -> OpenAI:
 
 
 # ---------------------------------------------------------------------------
-# JSON / token kwargs shared by both transports
+# Responses API
 # ---------------------------------------------------------------------------
-
-
-def _json_response_format(config: LLMConfig) -> dict | None:
-    """Chat Completions `response_format` payload, or None to omit."""
-    if isinstance(config.response_format, dict):
-        return {
-            "type": "json_schema",
-            "json_schema": {"name": "response", "schema": config.response_format},
-        }
-    if config.response_format == "json" and config.provider != "LM Studio Server":
-        # LM Studio only accepts json_schema or text.
-        return {"type": "json_object"}
-    return None
 
 
 def _responses_text_format(config: LLMConfig) -> dict | None:
@@ -137,23 +97,6 @@ def _responses_text_format(config: LLMConfig) -> dict | None:
     if config.response_format == "json":
         return {"format": {"type": "json_object"}}
     return None
-
-
-def _chat_token_kwargs(config: LLMConfig) -> dict:
-    """max_tokens / max_completion_tokens for Chat Completions."""
-    if model_uses_completion_tokens(config.model_name):
-        return {"max_completion_tokens": _default_output_tokens(config, 20000)}
-    if config.provider == "LM Studio Server":
-        return {"max_tokens": config.max_tokens or 8000}
-    # Groq / Mistral / DeepSeek: only set if the caller asked.
-    if config.max_tokens:
-        return {"max_tokens": config.max_tokens}
-    return {}
-
-
-# ---------------------------------------------------------------------------
-# Responses API (OpenAI)
-# ---------------------------------------------------------------------------
 
 
 def _to_responses_tools(tools: list[dict]) -> list[dict]:
@@ -289,21 +232,87 @@ def _responses_text(response) -> str:
     return "".join(parts)
 
 
+def _parse_tool_arguments(raw: object) -> tuple[dict, str | None]:
+    """Parse a tool call's arguments without raising.
+
+    Returns ``(arguments, parse_error)``. Models sometimes send truncated or
+    badly escaped JSON, or an empty string for no-argument tools. Raising here
+    would discard the whole exploration, so the error is handed back for the
+    agent loop to report to the model instead.
+    """
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return {}, None
+    if isinstance(raw, str):
+        try:
+            raw = _json.loads(raw)
+        except _json.JSONDecodeError as e:
+            return {}, f"arguments were not valid JSON ({e})"
+    if not isinstance(raw, dict):
+        return {}, f"arguments must be a JSON object, not {type(raw).__name__}"
+    return raw, None
+
+
 def _responses_tool_calls(response) -> list[ToolCallResult] | None:
     results: list[ToolCallResult] = []
     for item in getattr(response, "output", None) or []:
         if getattr(item, "type", None) != "function_call":
             continue
-        raw_args = getattr(item, "arguments", None) or "{}"
-        parsed = _json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        arguments, parse_error = _parse_tool_arguments(getattr(item, "arguments", None))
         results.append(
             ToolCallResult(
                 id=getattr(item, "call_id", None) or getattr(item, "id", "") or "",
                 function_name=getattr(item, "name", "") or "",
-                arguments=parsed if isinstance(parsed, dict) else {},
+                arguments=arguments,
+                parse_error=parse_error,
             )
         )
     return results or None
+
+
+def _extract_usage(response) -> dict[str, int | None]:
+    """Pull token usage off a Responses API response, as ``LLMResponse`` fields.
+
+    Returns ``prompt_tokens``, ``completion_tokens``, ``cached_prompt_tokens``
+    and ``uncached_prompt_tokens``; any not reported are ``None``. A missing or
+    all-zero usage reads as unknown, never zero: a completion that happened
+    consumed prompt tokens, and a caller that took "not reported" for zero would
+    think a token budget had nothing spent and run unbounded.
+    """
+    unknown: dict[str, int | None] = {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "cached_prompt_tokens": None,
+        "uncached_prompt_tokens": None,
+    }
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return unknown
+    prompt_tokens = getattr(usage, "input_tokens", None)
+    completion_tokens = getattr(usage, "output_tokens", None)
+    if not prompt_tokens and not completion_tokens:
+        return unknown
+    cached, uncached = _extract_cache_split(usage, prompt_tokens)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "cached_prompt_tokens": cached,
+        "uncached_prompt_tokens": uncached,
+    }
+
+
+def _extract_cache_split(usage, prompt_tokens: int | None) -> tuple[int | None, int | None]:
+    """Split ``prompt_tokens`` into ``(cached, uncached)`` prompt-cache tokens.
+
+    The uncached side is derived from ``prompt_tokens`` so the two always
+    reconcile with it. Returns ``(None, None)`` when nothing was reported about
+    caching.
+    """
+    details = getattr(usage, "input_tokens_details", None)
+    cached = getattr(details, "cached_tokens", None)
+    if not isinstance(cached, int) or not isinstance(prompt_tokens, int):
+        return None, None
+    cached = min(cached, prompt_tokens)
+    return cached, prompt_tokens - cached
 
 
 def _responses_thinking(response) -> str | None:
@@ -328,84 +337,12 @@ def _call_responses(
     kwargs = _responses_call_kwargs(config, messages, tools)
     response = client.responses.create(**kwargs)
 
-    content = _responses_text(response)
-    tool_calls = _responses_tool_calls(response) if tools else None
-    thinking = _responses_thinking(response)
-
     return LLMResponse(
-        content=content,
-        thinking=thinking,
+        content=_responses_text(response),
+        thinking=_responses_thinking(response),
         model=config.model_name,
-        tool_calls=tool_calls,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Chat Completions (OpenAI-compatible endpoints)
-# ---------------------------------------------------------------------------
-
-
-def _chat_call_kwargs(
-    config: LLMConfig,
-    messages: list[dict],
-    tools: list[dict] | None = None,
-) -> dict:
-    kwargs: dict = {
-        "model": config.model_name,
-        "messages": messages,
-        **_chat_token_kwargs(config),
-    }
-    if tools:
-        kwargs["tools"] = tools
-    else:
-        response_format = _json_response_format(config)
-        if response_format is not None:
-            kwargs["response_format"] = response_format
-    return kwargs
-
-
-def _call_chat_completions(
-    config: LLMConfig,
-    messages: list[dict],
-    tools: list[dict] | None = None,
-) -> LLMResponse:
-    """Call an OpenAI-compatible Chat Completions endpoint."""
-    client = _openai_client(config)
-    kwargs = _chat_call_kwargs(config, messages, tools)
-    response = client.chat.completions.create(**kwargs)
-
-    message = response.choices[0].message
-    content = message.content or ""
-
-    # Some local reasoning models emit the structured output into
-    # `reasoning_content` and leave `content` empty.
-    if not content.strip():
-        fallback = getattr(message, "reasoning_content", None)
-        if fallback:
-            content = fallback
-
-    tool_calls = None
-    if tools and getattr(message, "tool_calls", None):
-        tool_calls = [
-            ToolCallResult(
-                id=tc.id,
-                function_name=tc.function.name,
-                arguments=_json.loads(tc.function.arguments)
-                if isinstance(tc.function.arguments, str)
-                else tc.function.arguments,
-            )
-            for tc in message.tool_calls
-        ]
-
-    reasoning = None
-    if config.provider == "Groq API":
-        reasoning, content = extract_deepseek_reasoning(content)
-
-    return LLMResponse(
-        content=content,
-        reasoning=reasoning,
-        model=config.model_name,
-        tool_calls=tool_calls,
+        tool_calls=_responses_tool_calls(response) if tools else None,
+        **_extract_usage(response),
     )
 
 
@@ -444,50 +381,3 @@ def _image_messages(
         )
         messages.insert(0, {"role": "system", "content": system_prompt})
     return messages
-
-
-# ---------------------------------------------------------------------------
-# Utility functions (moved from utils.py)
-# ---------------------------------------------------------------------------
-
-
-def extract_deepseek_reasoning(response_text: str) -> tuple[str | None, str]:
-    """Extract reasoning from <think></think> tags in DeepSeek R1 responses.
-
-    Returns:
-        Tuple of (reasoning, final_output). Reasoning is None if no tags found.
-    """
-    think_pattern = r"<think>(.*?)</think>"
-    think_match = re.search(think_pattern, response_text, re.DOTALL)
-    if think_match:
-        reasoning = think_match.group(1).strip()
-        final_output = re.sub(think_pattern, "", response_text, flags=re.DOTALL).strip()
-        return reasoning, final_output
-    return None, response_text
-
-
-def process_groq_response(
-    response_text: str, model_name: str, expect_json: bool = True
-) -> tuple[str | None, str | dict]:
-    """Process a Groq API response, handling DeepSeek R1 reasoning extraction.
-
-    Returns:
-        Tuple of (reasoning, processed_output).
-    """
-    reasoning = None
-    final_output = response_text
-
-    if model_name == "deepseek-r1-distill-llama-70b":
-        reasoning, final_output = extract_deepseek_reasoning(response_text)
-
-    if expect_json:
-        try:
-            processed_output = _json.loads(final_output)
-        except _json.JSONDecodeError:
-            processed_output = final_output
-    elif "graph " in final_output:
-        processed_output = extract_mermaid_code(final_output)
-    else:
-        processed_output = final_output
-
-    return reasoning, processed_output

@@ -20,7 +20,11 @@ from stride_gpt.agent.report import (
     save_quick_report,
     save_report,
 )
-from stride_gpt.core.schemas import AnalysisReport, ThreatModelOutput
+from stride_gpt.core.schemas import (
+    AnalysisReport,
+    SubsystemFinding,
+    ThreatModelOutput,
+)
 
 # ---------------------------------------------------------------------------
 # render_markdown
@@ -139,6 +143,93 @@ class TestRenderSarif:
 # ---------------------------------------------------------------------------
 
 
+class TestOutcomeReporting:
+    """A crashed subsystem must not read as a clean one."""
+
+    def _report(self, sample_plan, findings) -> AnalysisReport:
+        return AnalysisReport(plan=sample_plan, findings=findings, metadata={})
+
+    def test_markdown_explains_a_failed_subsystem(self, sample_plan):
+        report = self._report(sample_plan, [
+            SubsystemFinding(
+                subsystem="Auth", threats=[], outcome="error",
+                error_class="context_overflow",
+            ),
+        ])
+
+        md = render_markdown(report)
+
+        assert "> **Status**: error" in md
+        assert "context window was exceeded" in md
+        assert "- **Subsystems analyzed**: 0/1" in md
+        assert "- **Not analyzed**: 1 error" in md
+
+    def test_markdown_says_nothing_extra_when_every_subsystem_completed(
+        self, sample_report: AnalysisReport
+    ):
+        md = render_markdown(sample_report)
+
+        assert "> **Status**" not in md
+        assert "- **Not analyzed**" not in md
+
+    def test_html_badges_a_failed_subsystem(self, sample_plan):
+        report = self._report(sample_plan, [
+            SubsystemFinding(
+                subsystem="Auth", threats=[], outcome="error",
+                error_class="rate_limited",
+            ),
+        ])
+
+        html = render_html(report)
+
+        assert "rate-limited the run" in html
+        # A failed subsystem has no threats, but saying so would be a lie.
+        assert "No threats identified." not in html
+
+    def test_html_still_says_no_threats_for_a_clean_subsystem(self, sample_plan):
+        report = self._report(sample_plan, [
+            SubsystemFinding(subsystem="Auth", threats=[]),
+        ])
+
+        assert "No threats identified." in render_html(report)
+
+    def test_the_outcome_survives_the_json_round_trip(self, sample_plan):
+        report = self._report(sample_plan, [
+            SubsystemFinding(
+                subsystem="Auth", threats=[], outcome="error", error_class="auth",
+            ),
+        ])
+
+        data = render_json(report)
+
+        assert data["subsystems"][0]["outcome"] == "error"
+        assert data["subsystems"][0]["error_class"] == "auth"
+        assert "> **Status**: error" in render_markdown_from_json(data)
+
+    def test_a_report_saved_before_outcomes_existed_renders_unchanged(self):
+        """No outcome key means the subsystem was analysed."""
+        data = {
+            "target": "app",
+            "overview": "",
+            "subsystems": [
+                {
+                    "name": "Auth",
+                    "threats": [],
+                    "improvement_suggestions": [],
+                    "files_analyzed": [],
+                }
+            ],
+            "cross_cutting_threats": [],
+            "metadata": {},
+        }
+
+        md = render_markdown_from_json(data)
+
+        assert "> **Status**" not in md
+        assert "- **Subsystems analyzed**: 1/1" in md
+        assert "No threats identified." in render_html_from_json(data)
+
+
 class TestFromJsonRenderers:
     def test_markdown_roundtrip(self, sample_report: AnalysisReport):
         data = render_json(sample_report)
@@ -151,6 +242,16 @@ class TestFromJsonRenderers:
         sarif = render_sarif_from_json(data)
         assert sarif["version"] == "2.1.0"
         assert len(sarif["runs"][0]["results"]) == 3
+
+    def test_sarif_live_and_saved_render_identically(self, sample_report: AnalysisReport):
+        """render_sarif delegates, so the two paths can never drift again.
+
+        They were separate near-identical implementations and had already
+        diverged on ``helpUri``.
+        """
+        assert render_sarif(sample_report) == render_sarif_from_json(
+            render_json(sample_report)
+        )
 
     def test_sarif_from_json_driver_version_is_configurable(
         self, monkeypatch, sample_report: AnalysisReport
@@ -936,3 +1037,274 @@ class TestSplitReportFolders:
             kinds = {r[2]["kind"] for r in all_reports}
             assert "legacy" in kinds
             assert "analyze" in kinds
+
+
+# ---------------------------------------------------------------------------
+# Evidence — per-threat locations
+# ---------------------------------------------------------------------------
+
+
+def _evidence_report(*evidence: dict) -> dict:
+    """A saved-report dict carrying one threat with the given evidence."""
+    return {
+        "subsystems": [
+            {
+                "name": "Auth",
+                "files_analyzed": ["auth.py", "login.py", "db.py", "extra.py"],
+                "threats": [
+                    {
+                        "Threat Type": "Spoofing",
+                        "Scenario": "Weak auth",
+                        "Potential Impact": "Takeover",
+                        "evidence": list(evidence),
+                    }
+                ],
+            }
+        ],
+        "cross_cutting_threats": [],
+    }
+
+
+def _locations(data: dict) -> list[dict]:
+    return render_sarif_from_json(data)["runs"][0]["results"][0].get("locations", [])
+
+
+class TestSarifEvidenceLocations:
+    """A threat should point at the code it cites, not at the subsystem's
+    first three files — that's what put threats against unrelated files."""
+
+    def test_one_location_per_verified_item_with_its_line_range(self):
+        data = _evidence_report(
+            {"path": "src/auth.py", "snippet": "x", "verified": True,
+             "start_line": 12, "end_line": 18},
+            {"path": "src/db.py", "snippet": "y", "verified": True,
+             "start_line": 4, "end_line": 4},
+        )
+        assert _locations(data) == [
+            {"physicalLocation": {"artifactLocation": {"uri": "src/auth.py"},
+                                  "region": {"startLine": 12, "endLine": 18}}},
+            {"physicalLocation": {"artifactLocation": {"uri": "src/db.py"},
+                                  "region": {"startLine": 4, "endLine": 4}}},
+        ]
+
+    def test_unverified_items_are_not_locations(self):
+        """An unverified snippet has no line range, so pointing at the file
+        would be the same imprecision the fallback already has."""
+        data = _evidence_report(
+            {"path": "src/auth.py", "snippet": "x", "verified": True,
+             "start_line": 3, "end_line": 3},
+            {"path": "src/nope.py", "snippet": "y", "verified": False},
+        )
+        assert [loc["physicalLocation"]["artifactLocation"]["uri"] for loc in _locations(data)] == [
+            "src/auth.py"
+        ]
+
+    def test_falls_back_to_files_analyzed_when_nothing_verified(self):
+        data = _evidence_report({"path": "src/nope.py", "snippet": "y", "verified": False})
+        assert _locations(data) == [
+            {"physicalLocation": {"artifactLocation": {"uri": f}}}
+            for f in ("auth.py", "login.py", "db.py")
+        ]
+
+    def test_paths_are_normalised_for_code_scanning(self):
+        """GitHub matches these against repository paths, so a leading ./ or
+        a Windows separator stops the location resolving."""
+        data = _evidence_report(
+            {"path": "./src\\auth.py", "snippet": "x", "verified": True,
+             "start_line": 1, "end_line": 1}
+        )
+        assert _locations(data)[0]["physicalLocation"]["artifactLocation"]["uri"] == "src/auth.py"
+
+    @pytest.mark.parametrize(
+        "item",
+        [
+            pytest.param({"verified": True, "start_line": 0, "end_line": 4}, id="zero-start"),
+            pytest.param({"verified": True, "start_line": 9, "end_line": 4}, id="end-before-start"),
+            pytest.param({"verified": True, "start_line": "3", "end_line": "4"}, id="strings"),
+            pytest.param({"verified": True, "start_line": True, "end_line": True}, id="bools"),
+            pytest.param({"verified": True}, id="no-range"),
+            pytest.param({"verified": True, "start_line": 1, "end_line": 1, "path": ""}, id="no-path"),
+        ],
+    )
+    def test_malformed_evidence_degrades_to_the_file_fallback(self, item):
+        """GitHub rejects a whole SARIF upload on one schema violation, and a
+        saved report can hold anything an LLM emitted."""
+        data = _evidence_report({"path": "src/auth.py", "snippet": "x", **item})
+        locations = _locations(data)
+        assert all("region" not in loc["physicalLocation"] for loc in locations)
+        assert len(locations) == 3
+
+    @pytest.mark.parametrize("evidence", ["not a list", None, [7, "x"]])
+    def test_junk_evidence_does_not_crash(self, evidence):
+        data = _evidence_report()
+        data["subsystems"][0]["threats"][0]["evidence"] = evidence
+        assert len(_locations(data)) == 3
+
+    def test_verification_status_in_properties_and_message(self):
+        data = _evidence_report(
+            {"path": "src/auth.py", "snippet": "x", "verified": True,
+             "start_line": 1, "end_line": 1},
+            {"path": "src/nope.py", "snippet": "y", "verified": False},
+        )
+        result = render_sarif_from_json(data)["runs"][0]["results"][0]
+        assert result["properties"]["evidence_verified"] == 1
+        assert result["properties"]["evidence_total"] == 2
+        # Also in the message: code-scanning UIs bury properties.
+        assert "Evidence: 1 of 2 snippets verified" in result["message"]["text"]
+
+    def test_pre_change_reports_are_unchanged(self):
+        """A report saved before evidence existed must render as it did."""
+        data = _evidence_report()
+        del data["subsystems"][0]["threats"][0]["evidence"]
+        result = render_sarif_from_json(data)["runs"][0]["results"][0]
+        assert "evidence_total" not in result["properties"]
+        assert "Evidence:" not in result["message"]["text"]
+        assert result["locations"] == [
+            {"physicalLocation": {"artifactLocation": {"uri": f}}}
+            for f in ("auth.py", "login.py", "db.py")
+        ]
+
+
+class TestSarifCrossCuttingEvidence:
+    """Emergent cross-cutting threats cite evidence; SARIF must carry it."""
+
+    def _result(self, *evidence: dict) -> dict:
+        data = {
+            "subsystems": [],
+            "cross_cutting_threats": [{
+                "Threat Type": "Information Disclosure",
+                "Scenario": "Key sent in cleartext",
+                "Potential Impact": "Key theft",
+                "Affected Subsystems": ["Frontend", "Server"],
+                "evidence": list(evidence),
+            }],
+        }
+        return render_sarif_from_json(data)["runs"][0]["results"][0]
+
+    def test_verified_evidence_becomes_locations_and_counts(self):
+        result = self._result(
+            {"path": "./app.py", "snippet": "x", "verified": True,
+             "start_line": 5, "end_line": 5},
+            {"path": "nope.py", "snippet": "y", "verified": False},
+        )
+        assert result["locations"] == [
+            {"physicalLocation": {"artifactLocation": {"uri": "app.py"},
+                                  "region": {"startLine": 5, "endLine": 5}}},
+        ]
+        assert result["properties"]["evidence_total"] == 2
+        assert result["properties"]["evidence_verified"] == 1
+        assert "Evidence: 1 of 2 snippets verified" in result["message"]["text"]
+
+    def test_nothing_verified_means_no_locations(self):
+        """There is no files_analyzed fallback for a cross-cutting threat."""
+        result = self._result({"path": "nope.py", "snippet": "y", "verified": False})
+        assert "locations" not in result
+        assert result["properties"]["evidence_verified"] == 0
+
+    def test_no_evidence_renders_as_before(self):
+        result = self._result()
+        assert "locations" not in result
+        assert "evidence_total" not in result["properties"]
+        assert "Evidence:" not in result["message"]["text"]
+
+
+class TestEvidenceInMarkdownAndHtml:
+    def test_column_appears_only_when_a_threat_has_evidence(self, sample_report):
+        assert "Evidence" not in render_markdown(sample_report)
+        sample_report.findings[0].threats[0]["evidence"] = [
+            {"path": "auth.py", "snippet": "x", "verified": True,
+             "start_line": 12, "end_line": 18}
+        ]
+        md = render_markdown(sample_report)
+        assert "| Evidence |" in md
+        assert "auth.py:12-18" in md
+
+    def test_unverified_cell_says_so(self, sample_report):
+        sample_report.findings[0].threats[0]["evidence"] = [
+            {"path": "auth.py", "snippet": "x", "verified": False}
+        ]
+        assert "auth.py (unverified)" in render_markdown(sample_report)
+
+    def test_single_line_range_is_not_written_as_a_span(self, sample_report):
+        sample_report.findings[0].threats[0]["evidence"] = [
+            {"path": "auth.py", "snippet": "x", "verified": True,
+             "start_line": 7, "end_line": 7}
+        ]
+        row = next(
+            line for line in render_markdown(sample_report).split("\n")
+            if "brute-force" in line
+        )
+        assert row.endswith("| auth.py:7 |")
+
+    def test_html_shows_the_snippet_and_its_range(self, sample_report):
+        sample_report.findings[0].threats[0]["evidence"] = [
+            {"path": "auth.py", "snippet": "if user == 'admin':", "verified": True,
+             "start_line": 12, "end_line": 18},
+            {"path": "gone.py", "snippet": "y", "verified": False},
+        ]
+        out = render_html(sample_report)
+        assert "auth.py:12-18" in out
+        assert "if user == &#x27;admin&#x27;:" in out
+        assert "unverified" in out
+
+    def test_html_escapes_hostile_snippets(self, sample_report):
+        sample_report.findings[0].threats[0]["evidence"] = [
+            {"path": "<img src=x onerror=alert(1)>", "verified": True,
+             "snippet": "</code></pre><script>alert(1)</script>",
+             "start_line": 1, "end_line": 1}
+        ]
+        out = render_html(sample_report)
+        assert "<script>alert(1)</script>" not in out
+        assert "<img src=x" not in out
+
+    def test_html_has_no_evidence_row_without_evidence(self, sample_report):
+        assert "Evidence" not in render_html(sample_report)
+
+
+_AMBIGUOUS = {
+    "path": "src/auth.py", "snippet": "x", "verified": True,
+    "start_line": 2, "end_line": 2, "occurrences": 3,
+}
+
+
+class TestAmbiguousEvidence:
+    """A snippet appearing twice is located at the first match.
+
+    The matcher records that; without surfacing it, code scanning pins the
+    threat to line 2 when the weakness is the copy on line 5, and presents
+    that as verified.
+    """
+
+
+    def test_markdown_cell_says_how_many_matches(self, sample_report):
+        sample_report.findings[0].threats[0]["evidence"] = [_AMBIGUOUS]
+        assert "src/auth.py:2 (3 matches)" in render_markdown(sample_report)
+
+    def test_single_match_says_nothing(self, sample_report):
+        sample_report.findings[0].threats[0]["evidence"] = [
+            {**_AMBIGUOUS, "occurrences": 1}
+        ]
+        md = render_markdown(sample_report)
+        assert "src/auth.py:2" in md
+        assert "matches" not in md
+
+    def test_html_carries_a_matches_pill(self, sample_report):
+        sample_report.findings[0].threats[0]["evidence"] = [_AMBIGUOUS]
+        assert "3 matches" in render_html(sample_report)
+
+    def test_sarif_flags_it_in_properties_and_message(self):
+        data = _evidence_report(_AMBIGUOUS)
+        result = render_sarif_from_json(data)["runs"][0]["results"][0]
+        assert result["properties"]["evidence_ambiguous"] is True
+        assert "first match" in result["message"]["text"]
+
+    def test_sarif_stays_quiet_when_every_match_is_unique(self):
+        data = _evidence_report({**_AMBIGUOUS, "occurrences": 1})
+        result = render_sarif_from_json(data)["runs"][0]["results"][0]
+        assert "evidence_ambiguous" not in result["properties"]
+        assert "first match" not in result["message"]["text"]
+
+    def test_an_unverified_item_is_never_called_ambiguous(self):
+        data = _evidence_report({**_AMBIGUOUS, "verified": False})
+        result = render_sarif_from_json(data)["runs"][0]["results"][0]
+        assert "evidence_ambiguous" not in result["properties"]

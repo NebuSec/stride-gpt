@@ -3,8 +3,9 @@
 Used by both the agentic report renderer (:mod:`stride_gpt.agent.report`) and
 the legacy single-shot renderer (:mod:`stride_gpt.core.threat_model`). Each
 threat object can optionally carry `OWASP_LLM`, `OWASP_ASI`,
-`INSIDER_CATEGORY`, and `MITRE_ATTACK` fields — these helpers detect which
-optional columns are populated and emit the right header/row shape.
+`INSIDER_CATEGORY`, `MITRE_ATTACK`, and `evidence` fields — these helpers
+detect which optional columns are populated and emit the right header/row
+shape.
 """
 
 from __future__ import annotations
@@ -16,15 +17,58 @@ from typing import Any, NamedTuple
 class ExtraColumns(NamedTuple):
     """Which optional columns to render across a report.
 
-    Tuple-positional for legacy unpacking (``show_llm, show_asi, show_insider,
-    show_mitre = detect_extra_columns(...)``); attribute-named for clarity at
-    keyword call sites.
+    Splat it into the header and row helpers (``threat_table_header(*cols)``)
+    rather than unpacking it by name — the tuple grows as reference cards add
+    fields, and a positional unpack breaks every call site when it does.
     """
 
     show_llm: bool
     show_asi: bool
     show_insider: bool
     show_mitre: bool
+    show_evidence: bool
+
+
+# Why a subsystem stopped, phrased for a report reader. Keyed by
+# ``SubsystemOutcome``; ``completed`` is absent because a completed subsystem
+# needs no explanation.
+_OUTCOME_NOTES: dict[str, str] = {
+    "budget_exhausted": (
+        "the analysis budget ran out, so threats were reported in a final round "
+        "without further exploration"
+    ),
+    "parse_failed": (
+        "the model's final answer could not be read, so this subsystem may be "
+        "incomplete"
+    ),
+    "unfinished": (
+        "the model stopped without finishing its analysis, so this subsystem may "
+        "be incomplete"
+    ),
+    "error": "the analysis stopped with an error",
+}
+
+_ERROR_CLASS_NOTES: dict[str, str] = {
+    "context_overflow": "the context window was exceeded",
+    "rate_limited": "the provider rate-limited the run",
+    "auth": "the provider rejected the credentials",
+    "provider_error": "the provider failed to answer",
+    "unexpected": "an unexpected error",
+}
+
+
+def outcome_note(outcome: str, error_class: str | None = None) -> str | None:
+    """A one-line explanation of a subsystem's outcome, or None if it completed.
+
+    Reports that show only threats make a crashed subsystem look like a clean
+    one with nothing to report. Markdown and HTML share this wording so they
+    can't drift.
+    """
+    note = _OUTCOME_NOTES.get(outcome)
+    if note is None:
+        return None
+    detail = _ERROR_CLASS_NOTES.get(error_class or "")
+    return f"{note} ({detail})" if detail else note
 
 
 def detect_extra_columns(
@@ -32,7 +76,7 @@ def detect_extra_columns(
 ) -> ExtraColumns:
     """Decide which optional columns to surface in the rendered tables.
 
-    Returns an :class:`ExtraColumns` 4-tuple. A column is shown only if at
+    Returns an :class:`ExtraColumns` tuple. A column is shown only if at
     least one threat carries a non-empty value for it. Compute this once at
     the report level so every table renders with the same shape — partial
     columns per subsystem would look broken.
@@ -48,6 +92,7 @@ def detect_extra_columns(
         # bug for values that are truthy but normalize to nothing (e.g. a bare
         # int, or the string shape before it was handled).
         show_mitre=any(normalize_mitre_techniques(t.get("MITRE_ATTACK")) for t in threats),
+        show_evidence=any(evidence_items(t) for t in threats),
     )
 
 
@@ -56,6 +101,7 @@ def threat_table_header(
     show_asi: bool,
     show_insider: bool,
     show_mitre: bool,
+    show_evidence: bool = False,
     *,
     cross_cutting: bool = False,
 ) -> tuple[str, str]:
@@ -74,6 +120,8 @@ def threat_table_header(
         cols.append("Insider Category")
     if show_mitre:
         cols.append("MITRE ATT&CK")
+    if show_evidence:
+        cols.append("Evidence")
     if cross_cutting:
         cols.append("Affected Subsystems")
     header = "| " + " | ".join(cols) + " |"
@@ -98,6 +146,7 @@ def threat_table_row(
     show_asi: bool,
     show_insider: bool,
     show_mitre: bool,
+    show_evidence: bool = False,
     *,
     cross_cutting: bool = False,
 ) -> str:
@@ -120,10 +169,122 @@ def threat_table_row(
         cells.append(_escape_md_cell(threat.get("INSIDER_CATEGORY") or ""))
     if show_mitre:
         cells.append(format_mitre_cell(threat.get("MITRE_ATTACK")))
+    if show_evidence:
+        cells.append(_escape_md_cell(format_evidence_cell(threat)))
     if cross_cutting:
         affected = threat.get("Affected Subsystems", [])
         cells.append(_escape_md_cell(", ".join(str(a) for a in affected)))
     return "| " + " | ".join(cells) + " |"
+
+
+SYSTEMIC_OBSERVATIONS_NOTE = (
+    "These summarise weaknesses already reported in the subsystem sections. "
+    "They are not separate threats and are not counted in the totals."
+)
+
+
+def related_threat_labels(
+    observation: dict[str, Any],
+    subsystems: Iterable[tuple[str, Iterable[dict[str, Any]]]],
+) -> list[tuple[str, str]]:
+    """``(id, description)`` for each threat a systemic observation links to.
+
+    ``subsystems`` is ``(name, threats)`` pairs. The description says where the
+    threat lives — ``Streamlit Frontend: Spoofing`` — because threat ids are not
+    shown in the tables. An id that matches no threat (a hand-edited or
+    truncated saved report) is kept with an empty description rather than
+    dropped, so the link stays visible.
+    """
+    known: dict[str, str] = {}
+    for name, threats in subsystems:
+        for threat in threats:
+            tid = threat.get("id")
+            if isinstance(tid, str) and tid:
+                known[tid] = f"{name}: {threat.get('Threat Type', 'Unknown')}"
+    related = observation.get("Related Threats")
+    if not isinstance(related, list):
+        return []
+    return [(str(tid), known.get(str(tid), "")) for tid in related]
+
+
+def systemic_observation_lines(
+    observation: dict[str, Any],
+    subsystems: Iterable[tuple[str, Iterable[dict[str, Any]]]],
+) -> list[str]:
+    """One systemic observation as a markdown bullet with its links.
+
+    A list rather than a table row: an observation is prose plus a set of
+    links, and none of the threat table's columns describe it. Values go
+    through :func:`_escape_md_cell` so LLM text can't start a new block.
+    """
+    lines = [
+        f"- **{_escape_md_cell(observation.get('Threat Type', 'Unknown'))}**: "
+        f"{_escape_md_cell(observation.get('Scenario', ''))}"
+    ]
+    if observation.get("Potential Impact"):
+        lines.append(f"  - Impact: {_escape_md_cell(observation['Potential Impact'])}")
+    affected = observation.get("Affected Subsystems")
+    if isinstance(affected, list) and affected:
+        lines.append(f"  - Affects: {_escape_md_cell(', '.join(str(a) for a in affected))}")
+    links = related_threat_labels(observation, subsystems)
+    if links:
+        rendered = "; ".join(
+            f"`{_escape_md_cell(tid)}`" + (f" ({_escape_md_cell(label)})" if label else "")
+            for tid, label in links
+        )
+        lines.append(f"  - Summarises: {rendered}")
+    return lines
+
+
+def evidence_items(threat: Any) -> list[dict[str, Any]]:
+    """Evidence entries on a threat, or none for a report written before it existed.
+
+    The agent records each threat's evidence as ``{path, snippet, verified,
+    start_line, end_line}``; ``/quick`` and pre-change saved reports have
+    none, so every renderer has to cope with the key being absent.
+    """
+    if not isinstance(threat, dict):
+        return []
+    evidence = threat.get("evidence")
+    if not isinstance(evidence, list):
+        return []
+    return [item for item in evidence if isinstance(item, dict)]
+
+
+def format_evidence_cell(threat: dict[str, Any]) -> str:
+    """Render a threat's evidence as ``src/auth.py:12-18; config.yaml (unverified)``.
+
+    A line range is the verification signal — a snippet we couldn't find in
+    the file has no range to show, so it says so instead. A snippet that
+    appears more than once says so too: the range is the first match, which
+    may not be the one the threat is about.
+    """
+    parts: list[str] = []
+    for item in evidence_items(threat):
+        if not item.get("verified"):
+            parts.append(f"{evidence_location(item)} (unverified)")
+            continue
+        occurrences = item.get("occurrences")
+        suffix = (
+            f" ({occurrences} matches)"
+            if isinstance(occurrences, int) and occurrences > 1
+            else ""
+        )
+        parts.append(f"{evidence_location(item)}{suffix}")
+    return "; ".join(parts)
+
+
+def evidence_location(item: dict[str, Any]) -> str:
+    """``src/auth.py:12-18`` for a verified item, the bare path otherwise."""
+    path = str(item.get("path") or "?")
+    if not item.get("verified"):
+        return path
+    start, end = item.get("start_line"), item.get("end_line")
+    if isinstance(start, int) and isinstance(end, int) and start != end:
+        return f"{path}:{start}-{end}"
+    if isinstance(start, int):
+        return f"{path}:{start}"
+    return path
 
 
 def is_mitre_technique_id(value: str) -> bool:

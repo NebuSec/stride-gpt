@@ -28,6 +28,12 @@ jobs:
           python-version: '3.12'
           enable-cache: true
 
+      # Every other step installs with --frozen, which trusts uv.lock as-is.
+      # Without this, a pyproject.toml change that never reached the lock
+      # passes CI (#242 bumped the ruff pin and left uv.lock on the old one).
+      - name: Check uv.lock is in sync with pyproject.toml
+        run: uv lock --check
+
       - name: Install dependencies
         run: uv sync --frozen
 
@@ -58,3 +64,25 @@ jobs:
 
       - name: Run tests
         run: uv run pytest
+
+  package:
+    name: Package (installed wheel)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.12'
+          enable-cache: true
+
+      - name: Build wheel
+        run: uv build --wheel -o dist
+
+      # Installs the wheel into a clean venv and runs it from outside the
+      # checkout. release.yml runs the same script before publishing.
+      - name: Smoke test the installed wheel
+        run: scripts/smoke_wheel.sh dist/*.whl

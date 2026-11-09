@@ -54,7 +54,7 @@ Three phases, all driven from `cli.py:analyze` (the subcommand) or `_handle_anal
 
 1. **Planning** (`agent/planner.py:create_plan`) — single LLM call. Scans the codebase, classifies the application type (`web` / `genai` / `agentic`), proposes 3–7 subsystems. User approves the plan interactively (or `--yes`).
 2. **Per-subsystem analysis** (`agent/loop.py:_analyze_subsystem`) — for each subsystem, a tool-using agent loop. The model reads files, greps, lists directories, and loads OWASP reference cards on demand, then emits a JSON finding. Token budget is shared across subsystems (remaining-budget arithmetic in `run_analysis`).
-3. **Synthesis** (`agent/loop.py:_synthesize`) — one LLM call. Reviews all per-subsystem findings and surfaces cross-cutting threats.
+3. **Synthesis** (`agent/loop.py:_synthesize`) — one LLM call. Reviews all per-subsystem findings (threat ids and evidence included) and classifies each output as an **aggregation** (a systemic restatement linking to subsystem threats by `Related Threats` ids; rendered as a systemic observation, not counted, not in SARIF) or an **emergent** threat (cites evidence, checked by `verify_evidence`, counted like any threat). `classify_synthesis` enforces both rules.
 
 Reports auto-save under `~/.stride-gpt/reports/`, split by kind: `/analyze` runs land in `reports/analyze/<target>_<timestamp>.json` and `/quick` runs in `reports/quick/<name>_<timestamp>.json` (see `config.py:analyze_reports_dir` / `quick_reports_dir`). The `/reports` slash command lists and re-renders saved reports (`--quick` / `--all` switch which kind it shows).
 
@@ -97,7 +97,8 @@ Each card is a markdown file with a YAML frontmatter block describing when to lo
 │                                                            │
 │ ## Reference cards                                         │
 │ Common cards named inline (genai / agentic /               │
-│ insider_threat) with their triggers and schema fields,     │
+│ insider_threat / mitre_enterprise / mitre_atlas) with      │
+│ their triggers and schema fields,                          │
 │ then: "Call list_references for the authoritative current  │
 │ catalogue; load_reference(name=...) for each that applies."│
 └────────────────────────────────────────────────────────────┘
@@ -108,7 +109,7 @@ The hybrid framing — name the common cards inline AND point at `list_reference
 The flow per subsystem:
 
 1. `base.md` is loaded as the system prompt for every subsystem analysis — always.
-2. The agent reads `base.md`, decides — per subsystem — which cards apply. It can call `list_references` to confirm the current catalogue (and discover any cards beyond the three named inline) and then calls `load_reference(name=...)` for each. A static-assets subsystem in an agentic codebase doesn't need the agentic card.
+2. The agent reads `base.md`, decides — per subsystem — which cards apply. It can call `list_references` to confirm the current catalogue (and discover any cards beyond those named inline) and then calls `load_reference(name=...)` for each. A static-assets subsystem in an agentic codebase doesn't need the agentic card.
 3. `load_reference` returns the card body (frontmatter stripped). It stays in the conversation history for the rest of that subsystem's analysis (and gets compressed away if the context window fills).
 4. Each card includes schema-addition instructions (e.g. "add `OWASP_LLM` to each threat"); the renderer in `agent/report.py` surfaces those fields as conditional columns.
 5. `/quick` reports record `llm_calls`, `tool_calls`, and a per-tool `tools_used` breakdown in metadata. `tool_calls: 0` or a `tools_used` block without `load_reference` is the diagnostic signal that a model has skipped discovery.
@@ -128,7 +129,7 @@ The pattern is decoupled from threat modelling. The recipe:
    And make the cards directory a real package (`__init__.py` present) so `find_packages` discovers it — otherwise package-data silently no-ops and the wheel ships without the files.
 5. **Name the common cards inline in the base prompt, alongside the `list_references` pointer.** Pure discovery-only prompts (just "call `list_references` first") work with frontier models but regress with smaller/faster ones (Gemini Flash skipped the catalogue call entirely in testing). Inline names act as a reliability fallback; `list_references` remains the authoritative current catalogue, so adding a new card is still a single-file commit.
 6. **Record tool-call activity in saved output** so a model skipping the discovery flow is visible without re-running with logs. `tool_calls: 0` or a `tools_used` block missing `load_reference` is the diagnostic signal. See `ThreatModelOutput.tools_used` and `save_quick_report`.
-7. **Render any per-card schema additions conditionally** — only show the column if at least one item in the report carries the field. See `agent/report.py:_detect_owasp_columns` and `_threat_table_header`.
+7. **Render any per-card schema additions conditionally** — only show the column if at least one item in the report carries the field. See `core/report_utils.py:detect_extra_columns` and `threat_table_header`.
 
 ### When this pattern is the right fit
 
@@ -144,42 +145,43 @@ The pattern is decoupled from threat modelling. The recipe:
 
 ## LLM provider abstraction
 
-Everything goes through `stride_gpt/core/llm.py` — `call_llm`, `call_llm_with_tools`, `call_llm_with_image`. Under the hood these use the official OpenAI SDK. **Never construct `OpenAI()` outside `core/llm.py`** — that's how provider-specific quirks leak across the codebase.
+Everything goes through `stride_gpt/core/llm.py` — `call_llm`, `call_llm_with_tools`, `call_llm_with_image`.
+Under the hood these use the official OpenAI SDK against the **Responses API**, the only protocol this fork supports.
+**Never construct `OpenAI()` outside `core/llm.py`** — that's how provider-specific quirks leak across the codebase.
 
-- **OpenAI API** → native Responses API (`client.responses.create`, `store=False`). Agent history stays in Chat Completions shape and is converted at this boundary (`messages_to_responses_input`, flat function tools).
-- **Mistral / Groq / DeepSeek / LM Studio** → Chat Completions against each provider's OpenAI-compatible `base_url`.
+Agent history stays in Chat Completions shape and is converted at this boundary (`messages_to_responses_input`, flat function tools).
+`LLMConfig.api_base` is passed through as the SDK's `base_url`, for a gateway that speaks Responses.
 
-Models are registered in `stride_gpt/models.py` with provider, default tokens, max tokens, and capability flags (`uses_max_completion_tokens`, `uses_responses`).
+Models are registered in `stride_gpt/models.py` with provider, default tokens, max tokens, and capability flags (`uses_max_completion_tokens`).
+`OpenAI` is the only registered provider; `_client_kwargs` refuses any other, so an old saved config can't send a request to the wrong service.
 
 ### Provider gotchas
 
-- **OpenAI Responses must set `store=False`.** Default storage would persist threat-model prompts (including source) on OpenAI's side.
-- **GPT-5 series uses `max_output_tokens` on Responses** (and `max_completion_tokens` on Chat Completions). Driven off `model_uses_completion_tokens` in the model registry.
-- **LM Studio only accepts `json_schema` or `text` response_format**, not `json_object`. Branch in `_json_response_format`.
-- **Groq DeepSeek emits `<think>` tags inline.** Extracted by `extract_deepseek_reasoning`.
-- **LM Studio needs a placeholder API key.** The OpenAI SDK refuses to build a client without one even for localhost.
-
-When adding a new OpenAI-compatible provider, add `chat_api_base` + `cli_prefix` on `ProviderInfo` and a `ModelInfo` list. Don't send Responses-only kwargs (`store`, `text.format`, flat tools) to Chat Completions endpoints.
+- **Responses must set `store=False`.** Default storage would persist threat-model prompts (including source) on OpenAI's side.
+- **GPT-5 and later use `max_output_tokens` on Responses.** Driven off `_default_output_tokens` and the model registry.
+- **Retries belong to the SDK** (`max_retries` in `_client_kwargs`): 408, 429, 5xx and dropped connections, honouring `Retry-After`.
+- **The SDK has no context-overflow exception.** It arrives as a 400, told apart by `code` or wording in `agent/errors.py:_is_context_overflow`.
 
 ## Adding a feature — orientation
 
 - **Prompt changes that affect both the agent and the legacy single-shot path** → edit the markdown reference cards. Section helpers in `core/prompts/builder.py` already load from them.
-- **A new agent capability** → typically a new tool in `agent/tools.py` (add to `AGENT_TOOLS` list + `_TOOL_DISPATCH` dict + the test in `test_tools.py:TestToolDefinitions:test_tool_names_match_dispatch`).
+- **A new agent capability** → typically a new tool in `agent/tools.py` (add to `AGENT_TOOLS` list + `_TOOL_DISPATCH` dict + the test in `test_tools.py:TestToolDefinitions:test_tool_names_match_dispatch`). A tool that records loop state rather than reading the sandbox belongs in `REPORTING_TOOLS` instead, handled in `agent/loop.py` — `report_threat` and `finish` are the worked example.
 - **A new output format** → add a renderer in `agent/report.py`, wire it into `cli.py:analyze` via the `OutputFormat` enum, add a from-JSON variant if it should work for saved reports.
-- **A new threat-model "lens"** (e.g. cloud-specific, IoT) → drop a new markdown card under `core/prompts/threat_model/` with a YAML frontmatter block (see existing cards for shape: `name`, `title`, `when_to_load`, `adds_fields`, `stride_letters`, `source`, `version`). Discovery picks it up automatically via `list_references` — no edits to `variants.py` or `tools.py` required. The inline card list in `base.md` / `quick_base.md` is a reliability hint for smaller models; if the new card is something every applicable codebase should reach for, add a line for it there (and to the "Current card catalogue" list under "Progressive disclosure pattern" above). If it's niche, leave the prompt alone and let `list_references` surface it. If the card declares a new field in `adds_fields`, also extend `_detect_extra_columns` / `_threat_table_header` / `_threat_table_row` in `agent/report.py` so the field renders. The planner classifier only needs a new app-type value if the card should auto-trigger; otherwise the agent decides per subsystem based on each card's `when_to_load`. See the `insider_threat` card for a worked example.
+- **A new threat-model "lens"** (e.g. cloud-specific, IoT) → drop a new markdown card under `core/prompts/threat_model/` with a YAML frontmatter block (see existing cards for shape: `name`, `title`, `when_to_load`, `adds_fields`, `stride_letters`, `source`, `version`). Discovery picks it up automatically via `list_references` — no edits to `variants.py` or `tools.py` required. The inline card list in `base.md` / `quick_base.md` is a reliability hint for smaller models; if the new card is something every applicable codebase should reach for, add a line for it there (and to the "Current card catalogue" list under "Progressive disclosure pattern" above). If it's niche, leave the prompt alone and let `list_references` surface it. If the card declares a new field in `adds_fields`, add it to the `report_threat` schema in `agent/tools.py` (the agent only records what the tool accepts) and extend `detect_extra_columns` / `threat_table_header` / `threat_table_row` in `core/report_utils.py` so the field renders. The planner classifier only needs a new app-type value if the card should auto-trigger; otherwise the agent decides per subsystem based on each card's `when_to_load`. See the `insider_threat` card for a worked example.
 
 ## Testing
 
 - pytest, runs in ~1.5s. `pytest -q` from the repo root.
 - Fixtures live in `tests/conftest.py`. `llm_config` gives a fake `LLMConfig`; `sandbox_dir` builds a small fake project tree; `sample_plan` / `sample_finding` / `sample_report` provide canned `AnalysisReport` data.
-- LLM calls are always mocked. The canonical pattern: `@patch("stride_gpt.agent.loop.call_llm_with_tools")` and feed `LLMResponse(content=..., tool_calls=...)`. End-to-end agent-loop tests in `test_loop.py:TestAppTypeFlow` mock multiple turns by setting `side_effect=[turn1, turn2, ...]`.
+- LLM calls never reach a provider. For anything that sends LLM traffic (the agent loop, `/quick`, planner, synthesis), use `ScriptedLLM` from `tests/fakes.py`. Script a list of steps with `call_tools(...)`, `reply(...)` and `fail(...)`, then run the code inside `with ScriptedLLM(steps) as fake:`. The fake patches `call_llm` / `call_llm_with_tools` in every agent-path module and records each request in `fake.requests`, with messages copied at call time. It fails the test if a request breaks the chat protocol (orphaned or missing tool results, consecutive user or assistant messages, system messages after the start, tool artifacts in a plain call) or offers the wrong tools, or if the script runs out or has steps left over. It checks this even when the code under test swallows the exception. See `test_loop.py:TestAgentLoopProtocol`.
+- Keep `MagicMock` for tests that aren't about LLM traffic: progress callbacks, or patching an internal helper such as `_analyze_subsystem` to test budget arithmetic.
 - For prompt content tests (`test_variants.py`), assert structural properties (a code is present, a column is rendered) — not exact text. Markdown content changes; structural assertions don't.
 
 ## Releasing
 
-- **Releases are automated.** Pushing a `vX.Y.Z` tag triggers `.github/workflows/release.yml`: it verifies the tag matches `pyproject.toml`'s `version`, runs the test matrix, publishes the CLI to PyPI (OIDC trusted publishing, no token), pushes the multi-arch UI image to Docker Hub `mrwadams/stridegpt`, and cuts a GitHub Release. Don't build or publish by hand.
+- **Releases are automated.** Pushing a `vX.Y.Z` tag triggers `.github/workflows/release.yml`: it verifies the tag matches `pyproject.toml`'s `version`, runs the test matrix, smoke-tests the built wheel, publishes the CLI to PyPI (OIDC trusted publishing, no token), pushes the multi-arch UI image to Docker Hub `mrwadams/stridegpt`, and cuts a GitHub Release. Don't build or publish by hand.
 - The tag must match `pyproject.toml` exactly or the `verify` job fails before anything publishes. See `RELEASING.md` for the cut-a-release steps and the one-time PyPI / Docker Hub credential setup.
-- Every push and PR is gated by `.github/workflows/ci.yml` (ruff + pytest on 3.12/3.13/3.14). Keep it green.
+- Every push and PR is gated by `.github/workflows/ci.yml`: `uv lock --check` and ruff, pytest on 3.12/3.13/3.14, and a Package job that installs the built wheel into a clean venv and runs `scripts/smoke_wheel.sh`. The smoke test catches what pytest can't, because pytest runs against the source tree: files missing from the wheel, and dependencies that only a fresh `pip install` resolves (#330). `release.yml` runs the same script before publishing. Keep it green.
 
 ## A few things to NOT do
 
