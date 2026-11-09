@@ -8,11 +8,11 @@ siblings next to the report:
 
 * ``<stem>.plan.json`` — the ``AnalysisPlan`` (analyze only)
 * ``<stem>.findings.json`` — the ``SubsystemFinding`` list + cross-cutting
-  threats + data flow diagram (analyze only)
+  threats + systemic observations + data flow diagram (analyze only)
 * ``<stem>.run.json`` — a ``RunManifest`` describing models, config, version,
   which reference cards the agent actually loaded, and a ``run_summary``
-  recording whether the run completed or a call cap truncated it (analyze
-  and quick)
+  recording whether every subsystem was analysed or some crashed, produced no
+  readable answer, or never started (analyze and quick)
 
 The format flag (`-f`) controls only the report artefact; siblings are
 always JSON.
@@ -20,22 +20,28 @@ always JSON.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
 import subprocess
-from datetime import datetime
+from collections.abc import Collection
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
+from stride_gpt.agent.evidence import normalise_path
 from stride_gpt.core.schemas import (
     AnalysisPlan,
     LLMConfig,
     ModelPair,
     Subsystem,
     SubsystemFinding,
+    TokenUsage,
+    count_analysed,
+    count_outcomes,
 )
 
 
@@ -59,13 +65,17 @@ class RunSummary(BaseModel):
     """Completeness of a run, so the intermediates are self-describing.
 
     Without this, an auditor reading ``findings.json`` in isolation can't
-    tell a full analysis from one a call/tool cap cut short — a truncated
-    run and a complete one look identical. ``status`` is:
+    tell a full analysis from one that lost subsystems along the way — a
+    truncated run and a complete one look identical. ``status`` is:
 
-    * ``"completed"`` — every planned subsystem was reached (analyze), or the
+    * ``"completed"`` — every planned subsystem was analysed (analyze), or the
       single-shot model returned (quick).
-    * ``"partial"`` — a call/tool cap stopped /analyze before every planned
-      subsystem was reached (``subsystems_analyzed < subsystems_planned``).
+    * ``"partial"`` — a subsystem crashed, produced no readable answer, was
+      never started because the run budget ran out, or synthesis failed.
+
+    A subsystem that took the #195 grace round still analysed the code, so it
+    counts towards ``subsystems_analyzed`` and doesn't make a run partial;
+    ``subsystem_outcomes`` is where that shows up.
 
     ``subsystems_planned`` / ``subsystems_analyzed`` are ``None`` for /quick,
     which has no per-subsystem phase.
@@ -74,8 +84,44 @@ class RunSummary(BaseModel):
     status: Literal["completed", "partial"]
     subsystems_planned: int | None = None
     subsystems_analyzed: int | None = None
+    # Subsystem count per ``SubsystemOutcome``, omitting outcomes that didn't
+    # occur. Empty for /quick.
+    subsystem_outcomes: dict[str, int] = {}
+    synthesis_error_class: str | None = None
     llm_calls: int
     tool_calls: int
+    # Names of subsystems reused from a checkpoint (``--resume``) versus
+    # analysed fresh this run. A run that didn't resume leaves
+    # ``resumed_subsystems`` empty and lists every subsystem it started in
+    # ``rerun_subsystems``; both are empty for /quick, which has no
+    # per-subsystem phase.
+    resumed_subsystems: list[str] = []
+    rerun_subsystems: list[str] = []
+    # Token totals for the run. ``token_usage_total.available`` is ``False``
+    # when no response anywhere in the run reported usage — distinct from a
+    # genuine zero. Empty for /quick, which has no phase or subsystem
+    # breakdown.
+    #
+    # The total is what *this* run spent. A ``--resume`` run reuses a
+    # checkpointed subsystem without an LLM call, so that subsystem's entry
+    # in ``token_usage_by_subsystem`` keeps the cost from the run that
+    # produced it while contributing nothing to the total: on a resumed run
+    # the per-subsystem figures deliberately don't sum to the total.
+    token_usage_total: TokenUsage = TokenUsage()
+    token_usage_by_phase: dict[str, TokenUsage] = {}
+    token_usage_by_subsystem: dict[str, TokenUsage] = {}
+    # Synthesis items dropped for failing validation, each as
+    # ``{"item": ..., "reason": ...}``. A run whose synthesis items were all
+    # dropped reports a non-zero count here; one where synthesis returned
+    # nothing reports zero. Always zero for /quick, which has no synthesis.
+    synthesis_items_dropped: int = 0
+    synthesis_dropped: list[dict[str, str]] = []
+    # How many key files the planner found and how many fit in its prompt
+    # (``KEY_FILE_SAMPLE_LIMIT``). ``key_files_shown < key_files_found`` means
+    # the planner saw a sample, so a subsystem may be missing from the plan.
+    # ``None`` for /quick, which has no planner.
+    key_files_found: int | None = None
+    key_files_shown: int | None = None
 
 
 class RunManifest(BaseModel):
@@ -120,6 +166,69 @@ class RunManifest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _anchor_forms() -> list[tuple[str, str]]:
+    """``(anchor, prefix)`` pairs for redacting a path textually.
+
+    Both the raw and resolved spelling of each anchor is included, since an
+    unresolvable path may carry either (``$HOME`` is a symlink on some
+    setups). Longest anchor first, so a cwd nested inside ``$HOME`` wins
+    the same way it does on the resolved path.
+    """
+    forms: set[tuple[str, str]] = set()
+    for base, prefix in ((_safe_cwd(), "./"), (_safe_home(), "~/")):
+        for spelling in base:
+            forms.add((spelling.rstrip(os.sep), prefix))
+    return sorted(forms, key=lambda f: -len(f[0]))
+
+
+def _safe_cwd() -> list[str]:
+    """Spellings of the working directory. Empty if it can't be read."""
+    try:
+        cwd = Path.cwd()
+    except OSError:
+        return []
+    return _spellings(cwd)
+
+
+def _safe_home() -> list[str]:
+    """Spellings of ``$HOME``. Empty if it isn't set and can't be inferred."""
+    try:
+        home_str = os.environ.get("HOME") or str(Path.home())
+    except (OSError, RuntimeError):
+        return []
+    return _spellings(Path(home_str)) if home_str else []
+
+
+def _spellings(base: Path) -> list[str]:
+    """``base`` as written and as resolved, deduplicated."""
+    out = [str(base)]
+    try:
+        resolved = str(base.resolve())
+    except OSError:
+        return out
+    if resolved != out[0]:
+        out.append(resolved)
+    return out
+
+
+def _redact_textually(raw: str) -> str:
+    """Apply redact_path's anchors to a path that could not be resolved.
+
+    Resolution failing is no reason to let ``/Users/<name>/...`` reach a
+    manifest, so the same anchors are matched against the string itself.
+    Whatever follows the anchor is kept as-is, malformed bytes included:
+    that part is evidence of what the model emitted, and it carries no
+    identity. A path matching neither anchor is returned unchanged, which
+    is rule 3 on a string rather than on a resolved path.
+    """
+    for anchor, prefix in _anchor_forms():
+        if raw == anchor:
+            return prefix
+        if raw.startswith(anchor + os.sep):
+            return prefix + raw[len(anchor) + 1 :]
+    return raw
+
+
 def redact_path(p: Path | str) -> str:
     """Return a serialisation-safe form of ``p``.
 
@@ -132,14 +241,19 @@ def redact_path(p: Path | str) -> str:
     2. Else if ``p`` resolves under ``$HOME``, return ``"~/..."``.
     3. Else return the absolute path verbatim — rare; the user explicitly
        pointed outside both anchors.
+
+    A path that cannot be resolved at all gets the same three rules applied
+    textually, so it is redacted rather than serialised verbatim.
     """
     path = Path(p) if not isinstance(p, Path) else p
     try:
         resolved = path.resolve()
-    except OSError:
-        # An unresolvable path (e.g. ``"stdin"``) is returned untouched —
-        # /quick uses this with non-filesystem identifiers.
-        return str(p)
+    except Exception:
+        # An unresolvable path (e.g. ``"stdin"``, or one containing a null
+        # byte from model output) still has to be redacted, and this must
+        # never raise, so any resolution failure falls back to matching the
+        # anchors against the original string.
+        return _redact_textually(str(p))
 
     cwd = Path.cwd().resolve()
     try:
@@ -230,6 +344,21 @@ def discover_git_sha(target: Path) -> str | None:
     return sha or None
 
 
+def discover_target_repo_path(target: Path) -> str | None:
+    """``target``'s path inside its git repository, or ``None`` outside one.
+
+    Unlike a redacted path, this stays the same when the run starts from a
+    different directory or the repository moves on disk.
+    """
+    root = _git_toplevel(target)
+    if root is None:
+        return None
+    try:
+        return target.resolve().relative_to(root.resolve()).as_posix()
+    except (OSError, ValueError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Sibling writers
 # ---------------------------------------------------------------------------
@@ -240,14 +369,44 @@ def _sibling_stem(output: Path) -> Path:
     return output.with_suffix("") if output.suffix else output
 
 
+def _sibling_path(output: Path, suffix: str) -> Path:
+    """``output``'s sibling for ``suffix``, keeping every dot in the stem.
+
+    ``with_suffix`` would strip a second suffix here, so ``report.v1.md`` and
+    ``report.v2.md`` would share one set of siblings.
+    """
+    stem = _sibling_stem(output)
+    return stem.with_name(stem.name + suffix)
+
+
 def _redact_subsystem(sub: Subsystem) -> Subsystem:
     return sub.model_copy(update={"key_files": [redact_path(f) for f in sub.key_files]})
 
 
 def _redact_finding(finding: SubsystemFinding) -> SubsystemFinding:
     return finding.model_copy(
-        update={"files_analyzed": [redact_path(f) for f in finding.files_analyzed]}
+        update={
+            "files_analyzed": [redact_path(f) for f in finding.files_analyzed],
+            "threats": [_redact_threat(t) for t in finding.threats],
+        }
     )
+
+
+def _redact_threat(threat: dict) -> dict:
+    """Redact the paths inside a threat's evidence.
+
+    Deep-copied rather than edited in place: ``model_copy`` is shallow, and
+    ``write_intermediates`` promises the in-memory report is left alone so the
+    auto-saved archive still gets verbatim values.
+    """
+    evidence = threat.get("evidence")
+    if not isinstance(evidence, list):
+        return threat
+    redacted = copy.deepcopy(threat)
+    for item in redacted["evidence"]:
+        if isinstance(item, dict) and isinstance(item.get("path"), str):
+            item["path"] = redact_path(item["path"])
+    return redacted
 
 
 def _write_json(path: Path, payload: str) -> None:
@@ -264,6 +423,7 @@ def write_intermediates(
     plan: AnalysisPlan | None = None,
     findings: list[SubsystemFinding] | None = None,
     cross_cutting: list[dict[str, Any]] | None = None,
+    systemic_observations: list[dict[str, Any]] | None = None,
     data_flow_diagram: str | None = None,
 ) -> list[Path]:
     """Persist JSON sibling artefacts next to ``output``.
@@ -280,7 +440,6 @@ def write_intermediates(
     Returns the list of paths written.
     """
     written: list[Path] = []
-    stem = _sibling_stem(output)
 
     if plan is not None:
         redacted_plan = plan.model_copy(
@@ -289,7 +448,7 @@ def write_intermediates(
                 "subsystems": [_redact_subsystem(s) for s in plan.subsystems],
             }
         )
-        plan_path = stem.with_suffix(".plan.json")
+        plan_path = _sibling_path(output, ".plan.json")
         _write_json(plan_path, redacted_plan.model_dump_json(indent=2))
         written.append(plan_path)
 
@@ -298,17 +457,28 @@ def write_intermediates(
         findings_payload = {
             "findings": [f.model_dump() for f in redacted_findings],
             "cross_cutting_threats": list(cross_cutting or []),
+            "systemic_observations": list(systemic_observations or []),
             "data_flow_diagram": data_flow_diagram,
         }
-        findings_path = stem.with_suffix(".findings.json")
+        findings_path = _sibling_path(output, ".findings.json")
         _write_json(findings_path, json.dumps(findings_payload, indent=2))
         written.append(findings_path)
 
-    run_path = stem.with_suffix(".run.json")
+    run_path = _sibling_path(output, ".run.json")
     _write_json(run_path, manifest.model_dump_json(indent=2))
     written.append(run_path)
 
     return written
+
+
+def checkpoint_path_for(output: Path) -> Path:
+    """Where a run's checkpoint lives, given its ``-o`` output path.
+
+    Mirrors ``write_intermediates``'s sibling-file convention — the
+    checkpoint sits alongside the ``.plan.json`` / ``.findings.json`` /
+    ``.run.json`` siblings.
+    """
+    return _sibling_path(output, ".checkpoint.json")
 
 
 # ---------------------------------------------------------------------------
@@ -343,21 +513,52 @@ def build_analyze_manifest(
     references_loaded: list[str],
     llm_calls: int,
     tool_calls: int,
-    subsystems_analyzed: int,
+    findings: list[SubsystemFinding],
+    resumed_subsystems: list[str] | None = None,
+    rerun_subsystems: list[str] | None = None,
+    token_usage_by_phase: dict[str, dict[str, int | None]] | None = None,
+    synthesis_error_class: str | None = None,
+    synthesis_dropped: list[dict[str, str]] | None = None,
 ) -> RunManifest:
     """Assemble the manifest for a /analyze run.
 
-    ``subsystems_analyzed`` is the number of subsystems that produced a
-    finding; when it's below the planned count a call/tool cap truncated the
-    run and ``run_summary.status`` is reported as ``"partial"``.
+    Completeness is derived from the findings' outcomes rather than from how
+    many findings there are — every planned subsystem gets one now, including
+    the ones that crashed or were never started.
+
+    ``token_usage_by_phase`` is the JSON-safe dict from
+    ``report.metadata["token_usage"]["by_phase"]`` — plain
+    ``{"prompt_tokens": ..., "completion_tokens": ..., "cached_prompt_tokens":
+    ..., "uncached_prompt_tokens": ...}`` dicts, reconstructed
+    into ``TokenUsage`` here. Per-subsystem totals come straight off
+    ``findings`` rather than a separate parameter — each finding already
+    carries its own.
     """
     subsystems_planned = len(plan.subsystems)
+    subsystems_analyzed = count_analysed(findings)
+    by_phase = {
+        name: TokenUsage(**usage) for name, usage in (token_usage_by_phase or {}).items()
+    }
+    token_usage_total = TokenUsage()
+    for usage in by_phase.values():
+        token_usage_total.merge(usage)
     run_summary = RunSummary(
-        status="partial" if subsystems_analyzed < subsystems_planned else "completed",
+        status="partial" if subsystems_analyzed < subsystems_planned or synthesis_error_class else "completed",
         subsystems_planned=subsystems_planned,
         subsystems_analyzed=subsystems_analyzed,
+        subsystem_outcomes=count_outcomes(findings),
+        synthesis_error_class=synthesis_error_class,
         llm_calls=llm_calls,
         tool_calls=tool_calls,
+        resumed_subsystems=resumed_subsystems or [],
+        rerun_subsystems=rerun_subsystems or [],
+        token_usage_total=token_usage_total,
+        token_usage_by_phase=by_phase,
+        token_usage_by_subsystem={f.subsystem: f.token_usage for f in findings},
+        synthesis_items_dropped=len(synthesis_dropped or []),
+        synthesis_dropped=list(synthesis_dropped or []),
+        key_files_found=plan.key_files_found,
+        key_files_shown=plan.key_files_shown,
     )
     return RunManifest(
         stride_gpt_version=_stride_gpt_version(),
@@ -407,6 +608,7 @@ def build_quick_manifest(
         status="completed",
         subsystems_planned=None,
         subsystems_analyzed=None,
+        subsystem_outcomes={},
         llm_calls=llm_calls,
         tool_calls=tool_calls,
     )
@@ -430,3 +632,345 @@ def build_quick_manifest(
         run_summary=run_summary,
         mode="quick",
     )
+
+
+# ---------------------------------------------------------------------------
+# Checkpoints — resuming an interrupted /analyze run (#197)
+# ---------------------------------------------------------------------------
+
+
+class Checkpoint(BaseModel):
+    """In-progress /analyze state, written after each subsystem finishes.
+
+    Lets ``--resume`` pick up a killed run (provider outage, Ctrl+C, crash)
+    without re-paying for subsystems that already finished. Only the plan
+    and per-subsystem findings are checkpointed — synthesis and the system
+    DFD always rerun on resume, since they reason over the *full* set of
+    findings and are cheap relative to a subsystem pass.
+    """
+
+    stride_gpt_version: str
+    started_at: datetime
+    updated_at: datetime
+    # Redacted per ``redact_path``, like the run manifest's ``target_path``.
+    target_path: str
+    target_git_sha: str | None
+    # Where the target sits inside its git repository, ``"."`` at the root and
+    # ``None`` outside one. ``target_path`` depends on the working directory
+    # the run started from, so this is what identifies the target on resume.
+    target_repo_path: str | None
+    # File name of the run's ``-o`` report. The report and its siblings sit
+    # next to the checkpoint, so resume can tell them from real code changes.
+    report_name: str
+    # Identifies the model/prompt pair this checkpoint was produced under.
+    # See ``compute_checkpoint_config_hash`` for why this isn't the same
+    # hash the run manifest records.
+    config_hash: str
+    app_type_source: str
+    plan: AnalysisPlan
+    findings: list[SubsystemFinding]
+
+
+def compute_checkpoint_config_hash(models: ModelPair) -> str:
+    """sha256 identifying the model/prompt pair a checkpoint was produced under.
+
+    Deliberately narrower than the run manifest's ``config_hash``, which
+    folds in every reference card loaded by the *end* of a run — discovered
+    progressively as subsystems execute. Using that here would make a
+    checkpoint's own hash drift as the run that wrote it progressed, so a
+    checkpoint could never validate against a resumption of itself.
+    ``references`` is always passed as ``[]``: this hash exists to catch
+    "the model or prompt changed", not "a different reference card happened
+    to load by this point".
+    """
+    from stride_gpt.core.prompts import base_system_prompt
+
+    return compute_config_hash(
+        system_prompt=base_system_prompt(), models=models, references=[]
+    )
+
+
+def build_checkpoint(
+    *,
+    plan: AnalysisPlan,
+    findings: list[SubsystemFinding],
+    target: Path,
+    output: Path,
+    models: ModelPair,
+    app_type_source: str,
+    started_at: datetime,
+) -> Checkpoint:
+    """Assemble a redacted checkpoint snapshot of the run so far.
+
+    Redaction mirrors ``write_intermediates`` — a checkpoint never contains
+    anything the final intermediates wouldn't.
+    """
+    redacted_plan = plan.model_copy(
+        update={
+            "target_path": redact_path(plan.target_path),
+            "subsystems": [_redact_subsystem(s) for s in plan.subsystems],
+        }
+    )
+    return Checkpoint(
+        stride_gpt_version=_stride_gpt_version(),
+        started_at=started_at,
+        updated_at=datetime.now(UTC),
+        target_path=redact_path(target),
+        target_git_sha=discover_git_sha(target),
+        target_repo_path=discover_target_repo_path(target),
+        report_name=output.name,
+        config_hash=compute_checkpoint_config_hash(models),
+        app_type_source=app_type_source,
+        plan=redacted_plan,
+        findings=[_redact_finding(f) for f in findings],
+    )
+
+
+def write_checkpoint(path: Path, checkpoint: Checkpoint) -> None:
+    """Atomically write ``checkpoint`` to ``path`` (temp file + rename).
+
+    A crash mid-write must never leave a half-written, unparseable
+    checkpoint behind — that defeats the whole point of checkpointing.
+    Writing to a temp file alongside ``path`` and renaming it into place
+    means the rename is the only step that has to be atomic; a reader never
+    observes a partial file.
+    """
+    payload = checkpoint.model_dump_json(indent=2)
+    if not payload.endswith("\n"):
+        payload += "\n"
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(payload)
+    tmp_path.replace(path)
+
+
+class CheckpointValidationError(Exception):
+    """A checkpoint is not safe to resume from. The message states why."""
+
+
+def load_checkpoint(path: Path) -> Checkpoint:
+    """Load and parse a checkpoint file.
+
+    Raises :class:`CheckpointValidationError` when the file is not a
+    checkpoint this version can read. A run is killed mid-write often enough
+    that a truncated or older-schema file is an ordinary thing to meet on
+    resume, and it has to come back as "cannot resume, here is why" — an
+    unhandled ``JSONDecodeError`` takes the interactive session down with it.
+    """
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        raise CheckpointValidationError(f"{path} could not be read as JSON: {e}") from e
+    try:
+        return Checkpoint(**data)
+    except (TypeError, ValidationError) as e:
+        raise CheckpointValidationError(
+            f"{path} is not a checkpoint this version can read: {e}"
+        ) from e
+
+
+def restore_checkpoint_paths(checkpoint: Checkpoint, *, target: Path) -> Checkpoint:
+    """Undo :func:`build_checkpoint`'s redaction, giving back live paths.
+
+    A checkpoint holds the plan and findings redacted (``./...``, ``~/...``),
+    which is right for a file on disk and wrong for the state a resumed run
+    reports from: the report renders paths in ``normalise_path``'s form and
+    titles itself from ``plan.target_path``. Handing the redacted copies
+    straight back made a resumed report differ from an uninterrupted one —
+    ``./src/a.py`` for reused subsystems beside ``src/a.py`` for re-run ones,
+    and ``# STRIDE Threat Model:`` with no project name for ``analyze .``.
+
+    ``redact_path`` only ever prefixes a project-relative path, so
+    ``normalise_path`` inverts it exactly for the path lists; the plan's
+    target is restored outright from the invocation, which knows it.
+    """
+    plan = checkpoint.plan.model_copy(
+        update={
+            "target_path": str(target),
+            "subsystems": [
+                s.model_copy(update={"key_files": [normalise_path(f) for f in s.key_files]})
+                for s in checkpoint.plan.subsystems
+            ],
+        }
+    )
+    return checkpoint.model_copy(
+        update={
+            "plan": plan,
+            "findings": [_restore_finding_paths(f) for f in checkpoint.findings],
+        }
+    )
+
+
+def _restore_finding_paths(finding: SubsystemFinding) -> SubsystemFinding:
+    """The inverse of ``_redact_finding`` for a finding's path fields."""
+    return finding.model_copy(
+        update={
+            "files_analyzed": [normalise_path(f) for f in finding.files_analyzed],
+            "threats": [_restore_threat_paths(t) for t in finding.threats],
+        }
+    )
+
+
+def _restore_threat_paths(threat: dict) -> dict:
+    evidence = threat.get("evidence")
+    if not isinstance(evidence, list):
+        return threat
+    restored = copy.deepcopy(threat)
+    for item in restored["evidence"]:
+        if isinstance(item, dict) and isinstance(item.get("path"), str):
+            item["path"] = normalise_path(item["path"])
+    return restored
+
+
+def _run_outputs(checkpoint: Checkpoint, checkpoint_path: Path) -> set[Path]:
+    """Every file the checkpointed run writes next to its checkpoint."""
+    report = checkpoint_path.with_name(checkpoint.report_name)
+    return {
+        checkpoint_path,
+        checkpoint_path.with_name(checkpoint_path.name + ".tmp"),
+        report,
+        report.with_suffix(".html"),
+        _sibling_path(report, ".plan.json"),
+        _sibling_path(report, ".findings.json"),
+        _sibling_path(report, ".run.json"),
+    }
+
+
+def is_git_dirty(target: Path, *, ignore: Collection[Path] = ()) -> bool:
+    """Whether ``target``'s git working tree has uncommitted changes.
+
+    Best-effort like :func:`discover_git_sha`, but errs the other way: a
+    failure to run ``git status`` is treated as "dirty" so resume refuses by
+    default rather than silently trusting code that might have moved on.
+
+    ``ignore`` names the paths that don't count as a change: the run's own
+    outputs. ``analyze . -o report.md`` writes them inside the repository
+    being analysed, so without this the feature blocks itself: the file that
+    makes resume possible is the untracked file that makes resume refuse, and
+    the only way through is ``--force``, which also switches off the "the code
+    moved on" protection this check exists to give.
+
+    ``--untracked-files=all`` lists the files inside a new directory. Git
+    otherwise reports just ``?? out/``, which can't be told apart from a new
+    source directory, and matching exact files means a source file added
+    beside the outputs still counts.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(target), "status", "--porcelain", "--untracked-files=all"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return True
+    if result.returncode != 0:
+        return True
+    ignored = set()
+    for path in ignore:
+        try:
+            ignored.add(path.resolve())
+        except OSError:
+            continue
+    return any(p not in ignored for p in _porcelain_paths(result.stdout, target))
+
+
+def _porcelain_paths(stdout: str, target: Path) -> list[Path]:
+    """Resolve the paths in ``git status --porcelain`` output.
+
+    Porcelain v1 prints paths relative to the repository root, not to
+    ``target``, so the root is what they have to be joined to. A rename is
+    printed as ``old -> new``; the new name is the one on disk.
+    """
+    root = _git_toplevel(target) or target
+    paths: list[Path] = []
+    for line in stdout.splitlines():
+        if len(line) < 4:
+            continue
+        name = line[3:]
+        if " -> " in name:
+            name = name.split(" -> ", 1)[1]
+        name = name.strip().strip('"')
+        if not name:
+            continue
+        try:
+            paths.append((root / name).resolve())
+        except OSError:
+            continue
+    return paths
+
+
+def _git_toplevel(target: Path) -> Path | None:
+    """``git rev-parse --show-toplevel`` for ``target``, or None."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(target), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    top = result.stdout.strip()
+    return Path(top) if top else None
+
+
+def validate_checkpoint_for_resume(
+    checkpoint: Checkpoint,
+    *,
+    target: Path,
+    models: ModelPair,
+    force: bool,
+    checkpoint_path: Path | None = None,
+) -> None:
+    """Raise :class:`CheckpointValidationError` if resuming would be unsound.
+
+    A changed git SHA, config hash or repository-relative target always
+    refuses — those mean the checkpointed findings describe code or a model
+    that no longer matches this invocation, and ``--force`` can't make stale
+    findings sound. A dirty working tree, or a target with no discoverable
+    git SHA at all, is weaker evidence (the code *might* still match what was
+    analysed) so ``--force`` can override either of those. Outside git the
+    only record of the target is a path relative to the working directory the
+    run started from, so a mismatch there is weak evidence too.
+    """
+    current_sha = discover_git_sha(target)
+    if checkpoint.target_git_sha != current_sha:
+        raise CheckpointValidationError(
+            "target_git_sha changed: checkpoint was "
+            f"{checkpoint.target_git_sha!r}, current is {current_sha!r}."
+        )
+
+    current_hash = compute_checkpoint_config_hash(models)
+    if checkpoint.config_hash != current_hash:
+        raise CheckpointValidationError(
+            "config_hash changed — the model or system prompt differs from "
+            "the checkpointed run."
+        )
+
+    current_repo_path = discover_target_repo_path(target)
+    if checkpoint.target_repo_path != current_repo_path:
+        raise CheckpointValidationError(
+            "target changed: checkpoint was "
+            f"{checkpoint.target_repo_path!r}, current is {current_repo_path!r}."
+        )
+
+    if force:
+        return
+    if current_sha is None and checkpoint.target_path != redact_path(target):
+        raise CheckpointValidationError(
+            f"target changed: checkpoint was {checkpoint.target_path!r}, current is "
+            f"{redact_path(target)!r}; pass --force to resume anyway."
+        )
+    if current_sha is None:
+        raise CheckpointValidationError(
+            "target has no discoverable git SHA; pass --force to resume anyway."
+        )
+    ignore = _run_outputs(checkpoint, checkpoint_path) if checkpoint_path else ()
+    if is_git_dirty(target, ignore=ignore):
+        raise CheckpointValidationError(
+            "target has uncommitted changes; pass --force to resume anyway."
+        )

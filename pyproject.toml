@@ -1,6 +1,6 @@
 [project]
 name = "stride-gpt"
-version = "0.19.0"
+version = "0.21.0"
 description = "AI-powered threat modeling using the STRIDE methodology"
 readme = "README.md"
 license = "MIT"
@@ -18,13 +18,14 @@ classifiers = [
 ]
 dependencies = [
     "httpx>=0.27",
-    "openai>=1.0",
+    "openai==3.45.0",
     "pydantic>=2.0",
     "python-dotenv>=1.0",
     "typer>=0.15",
     "rich>=13.0",
     "prompt_toolkit>=3.0",
     "defusedxml>=0.7.1",
+    "regex>=2026.6.28",
 ]
 
 [project.urls]
@@ -38,7 +39,7 @@ stride-gpt = "stride_gpt.cli:main"
 [dependency-groups]
 dev = [
     "pytest>=8.4",
-    "ruff==0.16.6",
+    "ruff==0.17.3",
 ]
 # Streamlit web-app deps (apps/web). Kept out of [project.dependencies] so the
 # published CLI wheel stays lean; a dependency-group is local/deploy-only and is
@@ -58,22 +59,35 @@ web = [
 # `uv sync` (used by SCC, CI, and release) installs these groups by default, so
 # the web app has its deps in every environment without extra flags.
 default-groups = ["dev", "web"]
+# Supply-chain cooldown: only resolve versions that have been on PyPI for at
+# least 5 days, so a poisoned release is yanked before `uv lock` can pick it up.
+# The security floors below still win once a fixed release is 5 days old.
+exclude-newer = "5 days"
 # Security floors for transitive deps not directly imported. Applied at lock
 # time and baked into uv.lock, which is the single source of truth for these
 # pins (the old requirements.txt duplication has been retired).
 # (No tornado floor: Streamlit >=1.59 runs on Starlette/Uvicorn, not Tornado.)
 constraint-dependencies = [
-    "urllib3>=2.7.0",
+    # urllib3: unbounded chunk-size line buffering, HTTPS proxy TLS config
+    # ignored, chunked deflate infinite loop (<2.8.0).
+    "urllib3>=2.8.0",
     "anyio>=4.14.2",
     "zipp>=4.1.0",
     "h11>=0.16.0",
     # gitpython via streamlit: long run of git-option-injection advisories
     # through 3.1.57 (arbitrary file overwrite, env-var exfiltration,
-    # git-config injection).
-    "gitpython>=3.1.60",
+    # git-config injection), then submodule update path traversal (<=3.1.61).
+    "gitpython>=3.1.62",
     # cryptography via pyjwt: Bleichenbacher oracle in PKCS#7 EnvelopedData
     # decryption (<50.0.0).
     "cryptography>=50.0.1",
+    # pyjwt via pygithub: HMAC/asymmetric key-confusion bypasses, JWKS redirect
+    # following, RecursionError DoS (<=2.14.0).
+    "pyjwt>=2.15.0",
+    # certifi via httpx/requests: bundled emSign ECC Root CA - G3 chains to
+    # eMudhra intermediates with compromised keys (GHSA-6q48-6c7w-9gw2, <2026.10.18).
+    # 2026.10.18 dropped all emSign roots; 2026.10.19 restored the unaffected ones.
+    "certifi>=2026.10.19",
 ]
 
 [build-system]

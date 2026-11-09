@@ -11,12 +11,21 @@ from pathlib import Path
 from typing import Any
 
 from stride_gpt.core.report_utils import (
+    SYSTEMIC_OBSERVATIONS_NOTE,
     detect_extra_columns,
+    evidence_items,
     normalize_mitre_techniques,
+    outcome_note,
+    systemic_observation_lines,
     threat_table_header,
     threat_table_row,
 )
-from stride_gpt.core.schemas import AnalysisReport, ModelPair, ThreatModelOutput
+from stride_gpt.core.schemas import (
+    ANALYSED_OUTCOMES,
+    AnalysisReport,
+    ModelPair,
+    ThreatModelOutput,
+)
 
 
 def _get_stride_gpt_version() -> str:
@@ -61,7 +70,7 @@ def render_markdown(report: AnalysisReport) -> str:
     lines.extend(f"- **{sub.name}**: {sub.description}" for sub in report.plan.subsystems)
     lines.append("")
 
-    show_llm, show_asi, show_insider, show_mitre = detect_extra_columns(
+    cols = detect_extra_columns(
         [t for f in report.findings for t in f.threats] + list(report.cross_cutting_threats)
     )
 
@@ -69,6 +78,7 @@ def render_markdown(report: AnalysisReport) -> str:
     for finding in report.findings:
         lines.append(f"## {finding.subsystem}")
         lines.append("")
+        lines.extend(_status_lines(finding.outcome, finding.error_class))
 
         if finding.files_analyzed:
             lines.append("### Files Analyzed")
@@ -79,14 +89,11 @@ def render_markdown(report: AnalysisReport) -> str:
         if finding.threats:
             lines.append("### Threats")
             lines.append("")
-            header, separator = threat_table_header(
-                show_llm, show_asi, show_insider, show_mitre
-            )
+            header, separator = threat_table_header(*cols)
             lines.append(header)
             lines.append(separator)
             lines.extend(
-                threat_table_row(threat, show_llm, show_asi, show_insider, show_mitre)
-                for threat in finding.threats
+                threat_table_row(threat, *cols) for threat in finding.threats
             )
             lines.append("")
 
@@ -100,18 +107,24 @@ def render_markdown(report: AnalysisReport) -> str:
     if report.cross_cutting_threats:
         lines.append("## Cross-Cutting Threats")
         lines.append("")
-        header, separator = threat_table_header(
-            show_llm, show_asi, show_insider, show_mitre, cross_cutting=True
-        )
+        header, separator = threat_table_header(*cols, cross_cutting=True)
         lines.append(header)
         lines.append(separator)
         lines.extend(
-            threat_table_row(
-                threat, show_llm, show_asi, show_insider, show_mitre,
-                cross_cutting=True,
-            )
+            threat_table_row(threat, *cols, cross_cutting=True)
             for threat in report.cross_cutting_threats
         )
+        lines.append("")
+
+    # Systemic observations — aggregations, not threats
+    if report.systemic_observations:
+        lines.append("## Systemic Observations")
+        lines.append("")
+        lines.append(SYSTEMIC_OBSERVATIONS_NOTE)
+        lines.append("")
+        subsystems = [(f.subsystem, f.threats) for f in report.findings]
+        for observation in report.systemic_observations:
+            lines.extend(systemic_observation_lines(observation, subsystems))
         lines.append("")
 
     # Summary
@@ -119,8 +132,19 @@ def render_markdown(report: AnalysisReport) -> str:
     lines.append("## Summary")
     lines.append("")
     lines.append(f"- **Total threats identified**: {total_threats}")
-    lines.append(f"- **Subsystems analyzed**: {len(report.findings)}")
+    lines.extend(
+        _subsystem_summary_lines(
+            [
+                {"outcome": f.outcome, "error_class": f.error_class}
+                for f in report.findings
+            ]
+        )
+    )
     lines.append(f"- **Cross-cutting threats**: {len(report.cross_cutting_threats)}")
+    lines.extend(_synthesis_summary_lines(report.metadata))
+    if report.systemic_observations:
+        lines.append(f"- **Systemic observations**: {len(report.systemic_observations)}")
+    lines.extend(_synthesis_dropped_lines(report.metadata))
     if report.metadata:
         lines.append(f"- **LLM calls**: {report.metadata.get('llm_calls', 'N/A')}")
         lines.append(f"- **Tool calls**: {report.metadata.get('tool_calls', 'N/A')}")
@@ -138,6 +162,56 @@ def render_markdown(report: AnalysisReport) -> str:
     return "\n".join(lines)
 
 
+def _synthesis_summary_lines(metadata: dict[str, Any]) -> list[str]:
+    error_class = metadata.get("synthesis_error_class")
+    if isinstance(error_class, str) and error_class:
+        return [f"- **Synthesis failed**: {error_class}"]
+    return []
+
+
+def _status_lines(outcome: str, error_class: str | None) -> list[str]:
+    """A blockquote under a subsystem heading when it didn't complete.
+
+    Without it a crashed subsystem reads as one that was analysed and found
+    nothing.
+    """
+    note = outcome_note(outcome, error_class)
+    if note is None:
+        return []
+    return [f"> **Status**: {outcome.replace('_', ' ')} — {note}.", ""]
+
+
+def _synthesis_dropped_lines(metadata: dict[str, Any] | None) -> list[str]:
+    """A summary line for synthesis items dropped by validation, if any.
+
+    Without it a run whose every synthesis item was dropped reads the same as
+    one where synthesis genuinely found nothing.
+    """
+    dropped = (metadata or {}).get("synthesis_dropped") or []
+    if not dropped:
+        return []
+    return [
+        f"- **Synthesis items dropped**: {len(dropped)} "
+        "(failed validation; reasons in run.json)"
+    ]
+
+
+def _subsystem_summary_lines(subsystems: list[dict[str, Any]]) -> list[str]:
+    """The summary block's subsystem counts, split by outcome."""
+    counts: dict[str, int] = {}
+    for sub in subsystems:
+        outcome = sub.get("outcome") or "completed"
+        counts[outcome] = counts.get(outcome, 0) + 1
+    analysed = sum(n for o, n in counts.items() if o in ANALYSED_OUTCOMES)
+
+    lines = [f"- **Subsystems analyzed**: {analysed}/{len(subsystems)}"]
+    unfinished = {o: n for o, n in counts.items() if o not in ANALYSED_OUTCOMES}
+    if unfinished:
+        detail = ", ".join(f"{n} {o.replace('_', ' ')}" for o, n in sorted(unfinished.items()))
+        lines.append(f"- **Not analyzed**: {detail}")
+    return lines
+
+
 def render_json(report: AnalysisReport) -> dict[str, Any]:
     """Render an AnalysisReport as a structured JSON-serializable dict."""
     return {
@@ -152,10 +226,13 @@ def render_json(report: AnalysisReport) -> dict[str, Any]:
                 "threats": f.threats,
                 "improvement_suggestions": f.improvement_suggestions,
                 "files_analyzed": f.files_analyzed,
+                "outcome": f.outcome,
+                "error_class": f.error_class,
             }
             for f in report.findings
         ],
         "cross_cutting_threats": report.cross_cutting_threats,
+        "systemic_observations": report.systemic_observations,
         "metadata": report.metadata,
     }
 
@@ -163,6 +240,9 @@ def render_json(report: AnalysisReport) -> dict[str, Any]:
 # SARIF message bodies surface in code-scanning UIs as plain text — bound the
 # length so a 50 KB LLM hallucination can't bloat an upload.
 _SARIF_MESSAGE_MAX = 5000
+
+# Evidence is capped at 5 items per threat, but saved reports predate that.
+_SARIF_MAX_LOCATIONS = 10
 
 
 def _sarif_text(value: Any) -> str:
@@ -192,120 +272,141 @@ def render_sarif(report: AnalysisReport) -> dict[str, Any]:
 
     SARIF (Static Analysis Results Interchange Format) is supported by
     GitHub, GitLab, Azure DevOps, and many IDEs for security findings.
+
+    Delegates to :func:`render_sarif_from_json` so a live run and a re-render
+    of the same run's saved JSON produce identical output. The two used to be
+    separate near-identical implementations and had already drifted (only this
+    one emitted ``helpUri``); keeping one implementation makes that impossible.
+    ``render_json`` preserves every field the SARIF renderer reads.
     """
-    rules: list[dict[str, Any]] = []
-    results: list[dict[str, Any]] = []
-    rule_ids: set[str] = set()
+    return render_sarif_from_json(render_json(report))
 
-    def _make_rule_id(threat_type: str) -> str:
-        return _make_sarif_rule_id(threat_type)
 
-    # Process per-subsystem threats
-    for finding in report.findings:
-        for threat in finding.threats:
-            threat_type = threat.get("Threat Type", "Unknown")
-            rule_id = _make_rule_id(threat_type)
+_STRIDE_HELP_URI = (
+    "https://learn.microsoft.com/en-us/azure/security/develop/"
+    "threat-modeling-tool-threats"
+)
 
-            safe_threat_type = _sarif_text(threat_type)[:200]
-            if rule_id not in rule_ids:
-                rule_ids.add(rule_id)
-                rules.append({
-                    "id": rule_id,
-                    "name": safe_threat_type,
-                    "shortDescription": {"text": f"STRIDE: {safe_threat_type}"},
-                    "helpUri": "https://learn.microsoft.com/en-us/azure/security/develop/threat-modeling-tool-threats",
-                })
 
-            scenario_txt = _sarif_text(threat.get("Scenario", ""))
-            impact_txt = _sarif_text(threat.get("Potential Impact", ""))
-            result_entry: dict[str, Any] = {
-                "ruleId": rule_id,
-                "level": "warning",
-                "message": {
-                    "text": f"{scenario_txt}\n\nPotential Impact: {impact_txt}",
-                },
-                "properties": {
-                    "subsystem": finding.subsystem,
-                },
-            }
-            if threat.get("OWASP_LLM"):
-                result_entry["properties"]["owasp_llm"] = threat["OWASP_LLM"]
-            if threat.get("OWASP_ASI"):
-                result_entry["properties"]["owasp_asi"] = threat["OWASP_ASI"]
-            if threat.get("INSIDER_CATEGORY"):
-                result_entry["properties"]["insider_category"] = threat["INSIDER_CATEGORY"]
-            mitre_ids = _sarif_mitre_ids(threat.get("MITRE_ATTACK"))
-            if mitre_ids:
-                result_entry["properties"]["mitre_attack"] = mitre_ids
-
-            # Add location if we know which files were analyzed
-            if finding.files_analyzed:
-                result_entry["locations"] = [
-                    {
-                        "physicalLocation": {
-                            "artifactLocation": {"uri": f},
-                        }
-                    }
-                    for f in finding.files_analyzed[:3]  # Limit to avoid bloat
-                ]
-
-            results.append(result_entry)
-
-    # Process cross-cutting threats
-    for threat in report.cross_cutting_threats:
-        threat_type = threat.get("Threat Type", "Unknown")
-        rule_id = _make_rule_id(threat_type)
-
-        safe_threat_type = _sarif_text(threat_type)[:200]
-        if rule_id not in rule_ids:
-            rule_ids.add(rule_id)
-            rules.append({
-                "id": rule_id,
-                "name": safe_threat_type,
-                "shortDescription": {"text": f"STRIDE: {safe_threat_type}"},
-            })
-
-        scenario_txt = _sarif_text(threat.get("Scenario", ""))
-        impact_txt = _sarif_text(threat.get("Potential Impact", ""))
-        cross_entry: dict[str, Any] = {
-            "ruleId": rule_id,
-            "level": "warning",
-            "message": {
-                "text": f"[Cross-cutting] {scenario_txt}\n\nPotential Impact: {impact_txt}",
-            },
-            "properties": {
-                "subsystem": "cross-cutting",
-                "affected_subsystems": threat.get("Affected Subsystems", []),
-            },
-        }
-        if threat.get("OWASP_LLM"):
-            cross_entry["properties"]["owasp_llm"] = threat["OWASP_LLM"]
-        if threat.get("OWASP_ASI"):
-            cross_entry["properties"]["owasp_asi"] = threat["OWASP_ASI"]
-        if threat.get("INSIDER_CATEGORY"):
-            cross_entry["properties"]["insider_category"] = threat["INSIDER_CATEGORY"]
-        mitre_ids = _sarif_mitre_ids(threat.get("MITRE_ATTACK"))
-        if mitre_ids:
-            cross_entry["properties"]["mitre_attack"] = mitre_ids
-        results.append(cross_entry)
-
+def _sarif_rule(rule_id: str, safe_threat_type: str) -> dict[str, Any]:
+    """Build the SARIF rule object for one STRIDE category."""
     return {
-        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [
-            {
-                "tool": {
-                    "driver": {
-                        "name": "STRIDE-GPT",
-                        "informationUri": "https://github.com/mrwadams/stride-gpt",
-                        "version": _get_stride_gpt_version(),
-                        "rules": rules,
-                    }
-                },
-                "results": results,
-            }
-        ],
+        "id": rule_id,
+        "name": safe_threat_type,
+        "shortDescription": {"text": f"STRIDE: {safe_threat_type}"},
+        "helpUri": _STRIDE_HELP_URI,
     }
+
+
+def _sarif_uri(path: Any) -> str:
+    """Normalise a path into a SARIF artifact URI.
+
+    GitHub matches these against repository paths, so a leading ``./`` or
+    ``/`` or a Windows separator stops a location resolving.
+    """
+    text = str(path or "").strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text.lstrip("/")
+
+
+def _sarif_region(item: dict[str, Any]) -> dict[str, int] | None:
+    """The 1-based inclusive line range of one evidence item, if it has a valid one.
+
+    Coerced rather than trusted: GitHub rejects an entire SARIF upload on one
+    schema violation, and saved reports can hold anything an LLM emitted.
+    """
+    start, end = item.get("start_line"), item.get("end_line")
+    if isinstance(start, bool) or isinstance(end, bool):
+        return None
+    if not isinstance(start, int) or not isinstance(end, int):
+        return None
+    if start < 1 or end < start:
+        return None
+    return {"startLine": start, "endLine": end}
+
+
+def _sarif_locations(threat: dict[str, Any], files_analyzed: Any) -> list[dict[str, Any]]:
+    """Locate a threat as precisely as its evidence allows.
+
+    One location per verified evidence item, with the line range the snippet
+    matched. Falls back to the subsystem's first few files only when nothing
+    verified — that fallback gives every threat in a subsystem the same
+    locations, which is what put threats against unrelated files.
+    """
+    locations = [
+        {
+            "physicalLocation": {
+                "artifactLocation": {"uri": uri},
+                "region": region,
+            }
+        }
+        for item in evidence_items(threat)
+        if item.get("verified")
+        and (region := _sarif_region(item))
+        and (uri := _sarif_uri(item.get("path")))
+    ]
+    if locations:
+        return locations[:_SARIF_MAX_LOCATIONS]
+
+    files = files_analyzed if isinstance(files_analyzed, list) else []
+    return [
+        {"physicalLocation": {"artifactLocation": {"uri": uri}}}
+        for f in files[:3]  # Limit to avoid bloat
+        if (uri := _sarif_uri(f))
+    ]
+
+
+def _sarif_evidence_properties(threat: dict[str, Any]) -> dict[str, Any]:
+    """Evidence counts for a result's ``properties``; empty when none was cited."""
+    items = evidence_items(threat)
+    if not items:
+        return {}
+    props: dict[str, Any] = {
+        "evidence_total": len(items),
+        "evidence_verified": sum(1 for item in items if item.get("verified")),
+    }
+    if _has_ambiguous_evidence(items):
+        props["evidence_ambiguous"] = True
+    return props
+
+
+def _sarif_evidence_note(threat: dict[str, Any]) -> str:
+    """A verification line for the result message.
+
+    In the message rather than only in ``properties`` because code-scanning
+    UIs show the message and bury the properties.
+    """
+    items = evidence_items(threat)
+    if not items:
+        return ""
+    verified = sum(1 for item in items if item.get("verified"))
+    plural = "" if len(items) == 1 else "s"
+    note = (
+        f"\n\nEvidence: {verified} of {len(items)} snippet{plural} verified "
+        "against the code."
+    )
+    if _has_ambiguous_evidence(items):
+        note += (
+            " Some snippets appear more than once in their file; the location "
+            "shown is the first match."
+        )
+    return note
+
+
+def _has_ambiguous_evidence(items: list[dict[str, Any]]) -> bool:
+    """Whether any verified snippet matched in more than one place.
+
+    The matcher records every match but reports the first, so a threat can be
+    pinned to line 2 when the weakness is the copy on line 5. Say so rather
+    than present the first match as the only one.
+    """
+    return any(
+        item.get("verified")
+        and isinstance(item.get("occurrences"), int)
+        and item["occurrences"] > 1
+        for item in items
+    )
 
 
 def _sarif_mitre_ids(value: Any) -> list[str]:
@@ -343,7 +444,7 @@ def save_report(report: AnalysisReport) -> Path:
 
     path = target_dir / filename
     rendered = render_json(report)
-    path.write_text(json.dumps(rendered, indent=2) + "\n")
+    path.write_text(json.dumps(rendered, indent=2) + "\n", encoding="utf-8")
     _write_html_companion(path, rendered)
     return path
 
@@ -399,6 +500,8 @@ def save_quick_report(
                 "threats": output.threat_model,
                 "improvement_suggestions": output.improvement_suggestions,
                 "files_analyzed": [],
+                "outcome": "completed",
+                "error_class": None,
             }
         ],
         "cross_cutting_threats": [],
@@ -406,7 +509,7 @@ def save_quick_report(
     }
 
     path = target_dir / filename
-    path.write_text(json.dumps(data, indent=2) + "\n")
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     _write_html_companion(path, data)
     return path
 
@@ -421,7 +524,7 @@ def _write_html_companion(json_path: Path, data: dict[str, Any]) -> None:
     try:
         from stride_gpt.agent.html_report import render_html_from_json
         html_path = json_path.with_suffix(".html")
-        html_path.write_text(render_html_from_json(data))
+        html_path.write_text(render_html_from_json(data), encoding="utf-8")
     except Exception as exc:
         import sys
         print(
@@ -535,11 +638,16 @@ def render_markdown_from_json(data: dict[str, Any]) -> str:
     for sub in data.get("subsystems", []):
         all_threats.extend(sub.get("threats", []))
     all_threats.extend(cross_cutting)
-    show_llm, show_asi, show_insider, show_mitre = detect_extra_columns(all_threats)
+    cols = detect_extra_columns(all_threats)
 
     for sub in data.get("subsystems", []):
         lines.append(f"## {sub['name']}")
         lines.append("")
+        # Reports saved before outcomes existed have no key; a subsystem that
+        # was written out at all had been analysed.
+        lines.extend(
+            _status_lines(sub.get("outcome", "completed"), sub.get("error_class"))
+        )
 
         files = sub.get("files_analyzed", [])
         if files:
@@ -552,15 +660,10 @@ def render_markdown_from_json(data: dict[str, Any]) -> str:
         if threats:
             lines.append("### Threats")
             lines.append("")
-            header, separator = threat_table_header(
-                show_llm, show_asi, show_insider, show_mitre
-            )
+            header, separator = threat_table_header(*cols)
             lines.append(header)
             lines.append(separator)
-            lines.extend(
-                threat_table_row(threat, show_llm, show_asi, show_insider, show_mitre)
-                for threat in threats
-            )
+            lines.extend(threat_table_row(threat, *cols) for threat in threats)
             lines.append("")
 
         suggestions = sub.get("improvement_suggestions", [])
@@ -573,18 +676,24 @@ def render_markdown_from_json(data: dict[str, Any]) -> str:
     if cross_cutting:
         lines.append("## Cross-Cutting Threats")
         lines.append("")
-        header, separator = threat_table_header(
-            show_llm, show_asi, show_insider, show_mitre, cross_cutting=True
-        )
+        header, separator = threat_table_header(*cols, cross_cutting=True)
         lines.append(header)
         lines.append(separator)
         lines.extend(
-            threat_table_row(
-                threat, show_llm, show_asi, show_insider, show_mitre,
-                cross_cutting=True,
-            )
+            threat_table_row(threat, *cols, cross_cutting=True)
             for threat in cross_cutting
         )
+        lines.append("")
+
+    systemic = data.get("systemic_observations") or []
+    if systemic:
+        lines.append("## Systemic Observations")
+        lines.append("")
+        lines.append(SYSTEMIC_OBSERVATIONS_NOTE)
+        lines.append("")
+        subsystems = [(sub["name"], sub.get("threats", [])) for sub in data.get("subsystems", [])]
+        for observation in systemic:
+            lines.extend(systemic_observation_lines(observation, subsystems))
         lines.append("")
 
     total = sum(len(s.get("threats", [])) for s in data.get("subsystems", []))
@@ -593,8 +702,12 @@ def render_markdown_from_json(data: dict[str, Any]) -> str:
     lines.append("## Summary")
     lines.append("")
     lines.append(f"- **Total threats identified**: {total}")
-    lines.append(f"- **Subsystems analyzed**: {len(data.get('subsystems', []))}")
+    lines.extend(_subsystem_summary_lines(data.get("subsystems", [])))
     lines.append(f"- **Cross-cutting threats**: {len(cross_cutting)}")
+    lines.extend(_synthesis_summary_lines(metadata))
+    if systemic:
+        lines.append(f"- **Systemic observations**: {len(systemic)}")
+    lines.extend(_synthesis_dropped_lines(metadata))
     if metadata:
         lines.append(f"- **LLM calls**: {metadata.get('llm_calls', 'N/A')}")
         lines.append(f"- **Tool calls**: {metadata.get('tool_calls', 'N/A')}")
@@ -627,11 +740,7 @@ def render_sarif_from_json(data: dict[str, Any]) -> dict[str, Any]:
 
             if rule_id not in rule_ids:
                 rule_ids.add(rule_id)
-                rules.append({
-                    "id": rule_id,
-                    "name": safe_threat_type,
-                    "shortDescription": {"text": f"STRIDE: {safe_threat_type}"},
-                })
+                rules.append(_sarif_rule(rule_id, safe_threat_type))
 
             scenario_txt = _sarif_text(threat.get("Scenario", ""))
             impact_txt = _sarif_text(threat.get("Potential Impact", ""))
@@ -639,10 +748,14 @@ def render_sarif_from_json(data: dict[str, Any]) -> dict[str, Any]:
                 "ruleId": rule_id,
                 "level": "warning",
                 "message": {
-                    "text": f"{scenario_txt}\n\nPotential Impact: {impact_txt}",
+                    "text": (
+                        f"{scenario_txt}\n\nPotential Impact: {impact_txt}"
+                        + _sarif_evidence_note(threat)
+                    ),
                 },
                 "properties": {"subsystem": sub["name"]},
             }
+            result_entry["properties"].update(_sarif_evidence_properties(threat))
             if threat.get("OWASP_LLM"):
                 result_entry["properties"]["owasp_llm"] = threat["OWASP_LLM"]
             if threat.get("OWASP_ASI"):
@@ -652,11 +765,9 @@ def render_sarif_from_json(data: dict[str, Any]) -> dict[str, Any]:
             mitre_ids = _sarif_mitre_ids(threat.get("MITRE_ATTACK"))
             if mitre_ids:
                 result_entry["properties"]["mitre_attack"] = mitre_ids
-            if files:
-                result_entry["locations"] = [
-                    {"physicalLocation": {"artifactLocation": {"uri": f}}}
-                    for f in files[:3]
-                ]
+            locations = _sarif_locations(threat, files)
+            if locations:
+                result_entry["locations"] = locations
             results.append(result_entry)
 
     for threat in data.get("cross_cutting_threats", []):
@@ -665,24 +776,24 @@ def render_sarif_from_json(data: dict[str, Any]) -> dict[str, Any]:
         safe_threat_type = _sarif_text(threat_type)[:200]
         if rule_id not in rule_ids:
             rule_ids.add(rule_id)
-            rules.append({
-                "id": rule_id,
-                "name": safe_threat_type,
-                "shortDescription": {"text": f"STRIDE: {safe_threat_type}"},
-            })
+            rules.append(_sarif_rule(rule_id, safe_threat_type))
         scenario_txt = _sarif_text(threat.get("Scenario", ""))
         impact_txt = _sarif_text(threat.get("Potential Impact", ""))
         cross_entry: dict[str, Any] = {
             "ruleId": rule_id,
             "level": "warning",
             "message": {
-                "text": f"[Cross-cutting] {scenario_txt}\n\nPotential Impact: {impact_txt}",
+                "text": (
+                    f"[Cross-cutting] {scenario_txt}\n\nPotential Impact: {impact_txt}"
+                    + _sarif_evidence_note(threat)
+                ),
             },
             "properties": {
                 "subsystem": "cross-cutting",
                 "affected_subsystems": threat.get("Affected Subsystems", []),
             },
         }
+        cross_entry["properties"].update(_sarif_evidence_properties(threat))
         if threat.get("OWASP_LLM"):
             cross_entry["properties"]["owasp_llm"] = threat["OWASP_LLM"]
         if threat.get("OWASP_ASI"):
@@ -692,6 +803,11 @@ def render_sarif_from_json(data: dict[str, Any]) -> dict[str, Any]:
         mitre_ids = _sarif_mitre_ids(threat.get("MITRE_ATTACK"))
         if mitre_ids:
             cross_entry["properties"]["mitre_attack"] = mitre_ids
+        # No files_analyzed to fall back on: a cross-cutting threat is located
+        # by its verified evidence or not at all.
+        locations = _sarif_locations(threat, [])
+        if locations:
+            cross_entry["locations"] = locations
         results.append(cross_entry)
 
     return {

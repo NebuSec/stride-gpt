@@ -48,8 +48,8 @@ If you find STRIDE GPT useful, please consider supporting the project:
 - Generates Gherkin test cases based on identified threats
 - GitHub repository analysis for comprehensive threat modelling (including GitHub Enterprise support)
 - Multiple output formats: Markdown, JSON, SARIF (imports into GitHub, GitLab, Azure DevOps, IDEs), and a self-contained HTML view for sharing with stakeholders
-- Advanced reasoning model support (OpenAI GPT-5.4/5.5 series, Mistral Magistral series)
-- LLM providers via the OpenAI SDK: OpenAI (native Responses API), plus OpenAI-compatible Chat Completions for Mistral, Groq, DeepSeek, and local LM Studio Server
+- Current model support (OpenAI GPT-6 series)
+- LLM calls through the official OpenAI SDK, using the native Responses API
 - No data storage; application details are not saved
 - Available as a Docker container image for easy deployment
 - Environment variable support for secure configuration
@@ -75,7 +75,32 @@ This video is an excellent resource for anyone interested in understanding how S
 
 ## Changelog
 
-### Version 0.19 (latest)
+### Version 0.21 (latest)
+
+- **Fresh installs work again** (#330, #283, #334): From litellm 1.106.0, every tool-calling request imports `mcp`, so a clean `pip install stride-gpt` failed on its first subsystem. STRIDE-GPT now depends on `litellm[mcp]`. CI and the release workflow install the built wheel into an empty environment and smoke-test it before anything reaches PyPI.
+- **Planning and budgets** (#226, #306, #264, #271, #175, #300): The planner finds every key file and splits the codebase into deployable services. Each service is analysed only by the worker that owns its code, so the same code is no longer reported from several subsystems. `--max-llm-calls` and `--max-tool-calls` now cap each subsystem, where before they capped the whole run and later subsystems could be dropped. A subsystem that stops partway is recorded as `unfinished` and marks the run `partial`; it used to be recorded as `completed`.
+- **Threat IDs and synthesis** (#209, #212, #251, #252, #265, #225): Every threat has a stable ID. Synthesis either links a systemic observation to the subsystem threats it summarises, or reports an emergent threat, such as a chain across subsystems, whose evidence has to verify. A failed synthesis keeps the subsystem findings. Token usage counts cache hits separately.
+- **Errors and resume** (#258, #262, #297, #303, #305): Rate limits and server errors are retried. A run that still fails ends with one line quoting the provider's message and a non-zero exit, and so does a run where nothing was analysed. Resume refuses a checkpoint from another directory in the same repository, and Ctrl-C prints the command that resumes the run. Smaller fixes cover `-o` directories, REPL flags, `/quick` reference cards, quick report names and markup in model output.
+- **Models, prompts and the web UI** (#245, #324, #328, #276, #294, #326): Claude Sonnet 5.5 and Haiku 5.5 replace Sonnet 5 and Haiku 4.5, Anthropic budget thinking is removed, and DeepSeek planning works again. The prompts treat each external service as outside the system's trust boundary. Every web UI tab now makes one provider-agnostic call, and generated DFDs appear in the editor.
+- **Supply chain**: Nine dependencies have raised security floors. Lockfile resolution skips releases less than 5 days old, and the unused `anthropic` and `groq` SDKs are gone from the web extras.
+
+**Upgrading:** Checkpoints written by 0.20 don't resume, because the config hash changed when budget thinking was removed. Start those runs again. Findings files no longer use the `skipped` outcome.
+
+### Version 0.20
+
+- **Resume an interrupted analysis** (closes #197): `analyze` now checkpoints the approved plan and each subsystem finding as it completes, next to the `-o` report. `--resume <checkpoint>` reuses the subsystems that finished and reruns the rest, then runs synthesis and the data flow diagram as usual. Resume refuses when the target's git SHA or the config hash no longer match, naming which changed, so stale findings can't be stitched into a run of different code. A dirty working tree or a missing git SHA refuses unless `--force`; a changed SHA refuses even with it. The run manifest records which subsystems were reused and which were rerun.
+- **Threats cite verified evidence** (closes #195): Each threat is now reported through a tool call carrying the code it came from, and every quoted snippet is checked against the file on disk before the threat is recorded. SARIF locations point at the file and line range the evidence was found at, rather than giving every threat in a subsystem the same three files, and `files_analyzed` reflects what the agent actually read rather than what it claimed to.
+- **Every subsystem records why it stopped** (closes #196): A `SubsystemFinding` now carries an `outcome` — `completed`, `budget_exhausted`, `parse_failed`, `error`, or `skipped` — so a subsystem that crashed is no longer indistinguishable from one that was analysed and found nothing. Findings always match the plan: subsystems the run budget never reached are recorded as `skipped` rather than dropped. `run_summary.status` is derived from those outcomes, so a run where subsystems crashed is reported as `partial` instead of `completed`, and a clean subsystem with zero threats no longer makes the console print "Analysis partially complete". Failures are classified from the exception type (`context_overflow`, `rate_limited`, `auth`, `provider_error`) rather than by searching the error text, and the markdown and HTML reports show failed and skipped subsystems explicitly. Findings files written before this change still load, treated as `completed`.
+- **Token usage recorded per phase and per subsystem** (#198): Prompt and completion tokens are read off each provider response and aggregated per phase (planning, exploration, compression, synthesis, DFD), per subsystem, and as a run total. The console summary gains a token line and `<stem>.run.json` gains `token_usage_total`, `token_usage_by_phase` and `token_usage_by_subsystem`. "Unknown" stays distinct from zero: some providers never report usage, so an all-zero reading records as unavailable rather than free. These are token counts, not costs: cache hit and miss tokens are not yet split out (#225), so a provider that serves most of a conversation from its prefix cache bills well below what the totals imply.
+- **The planner represents every directory it found** (#175, closes #180): The key-file sample sent to the planner was a flat alphabetical slice, so one early-sorting directory could consume the whole budget and a later-sorting service reached the planner with no file-level signal at all. On OWASP crAPI that dropped two of six services from the plan entirely while the run still reported complete. The sample now round-robins across the whole directory tree, at any depth, and its header says it is a sample rather than reporting the total over a silently truncated list. `search_files`' truncation marker is no longer mixed into that list as if it were a file.
+- **`read_file` pages by line range** (closes #194): `read_file` takes optional 1-based `start_line` and `end_line` arguments and returns numbered lines under a header giving the total line count, the exact range shown, and whether the byte cap cut it short. Previously it returned the first 50 KB and nothing more, so the agent could not read past that point and had no line numbers to cite. When output is truncated, a hint gives the line to request next.
+- **OpenRouter as a model provider** (#221): Routes through LiteLLM's `openrouter/` prefix, authenticated with `OPENROUTER_API_KEY`, with a shortlist of six tool-capable models and any other slug available through the wizard's Custom option. CLI only for now. Also fixed: `--worker-model` naming a provider your saved config doesn't know about resolved the model from the flag but the API key from the config file, so the request could carry the wrong provider's secret (#222).
+- **Model registry refreshed** (#223): Current lineups for OpenAI, Anthropic, DeepSeek, Mistral, Groq, Google and OpenRouter, with retired models dropped. `supports_thinking` now tracks which models actually accept the legacy extended-thinking parameter, since Claude 4.7 and later reject it, and the Streamlit thinking checkbox follows that flag rather than the provider.
+- **Security: the agent's file tools can no longer reach version-control metadata** (#191, #190): `read_file`, `grep_content` and `list_directory` refuse any path resolving inside `.git`, `.hg` or `.svn`, directly or through a committed symlink. `actions/checkout` writes the job token into `.git/config`, and some clones embed a token in the remote URL, so analysing a CI checkout put credentials within reach of a model-driven read. `grep_content` also checked only its starting path before reading everything `os.walk` returned; it now applies the same resolved-path check to each file, matching `read_file`. `list_directory` no longer follows symlinks out of the sandbox when reporting type and size.
+- **Malformed model output can no longer destroy a run's intermediates** (closes #208): A null byte in a planner-supplied file path crashed path redaction, which runs while persisting `plan.json`, `findings.json` and `run.json` — after every LLM call had been paid for. Redaction is now total, and an unresolvable path is still redacted rather than written out verbatim, so a home directory can't leak into a manifest that goes to git or a ticket. Genuine disk and serialisation failures still fail the run loudly.
+- **Supply chain and scan hygiene** (#176, #177): Cleared 22 Dependabot alerts by updating gitpython, aiohttp and cryptography through the lockfile, cut Trivy base-image noise that was burying actionable findings, and cleared the remaining 18 CodeQL code-quality findings. Scheduled secret scanning no longer fails on model identifiers, and the CI security summary reports icons that follow the job result.
+
+### Version 0.19
 
 - **`--version` flag** (#161): `stride-gpt --version` now prints the installed version and exits, and the interactive TUI banner shows the running version so you can confirm what you're on at a glance.
 - **Dependency management consolidated onto uv** (closes #155): `uv.lock` is now the single source of truth for every dependency. The duplicated `requirements.txt` files are retired; the Docker UI image and the security-scan workflow install from `uv.lock` via `uv export`, so what ships and what gets scanned can no longer drift from what's locked. No change for `pip install stride-gpt` users.
@@ -363,7 +388,7 @@ The `apps/` directory is the slot for additional deployable frontends — for ex
 stride-gpt analyze .
 
 # Specify a model and auto-approve the analysis plan
-stride-gpt analyze ./my-app --worker-model groq/llama-3.3-70b-versatile -y
+stride-gpt analyze ./my-app --worker-model openai/gpt-6-luna -y
 
 # Export as JSON, SARIF, or browser-viewable HTML
 stride-gpt analyze . -o report.json -f json    # also writes report.html alongside
@@ -423,7 +448,7 @@ Launch the REPL with `stride-gpt` (no arguments), then use these commands and sh
 **Check the installed version:**
 
 ```bash
-stride-gpt --version    # prints e.g. "stride-gpt 0.19.0" and exits
+stride-gpt --version    # prints e.g. "stride-gpt 0.21.0" and exits
 ```
 
 **Common flags:**
@@ -435,12 +460,12 @@ stride-gpt --version    # prints e.g. "stride-gpt 0.19.0" and exits
 | `-f`, `--format` | Output format: `markdown` (default), `json`, `sarif`, `html` |
 | `-i`, `--input` | Read the app description from a file (`quick` only) |
 | `-y`, `--yes` | Auto-approve the analysis plan (`analyze` only) |
-| `--worker-model` | Default-tier model handling the bulk of calls (e.g. `groq/llama-3.3-70b-versatile`). Uses saved config if omitted. |
-| `--architect-model` | Stronger model for planning/synthesis (e.g. `openai/gpt-5.4`). Uses saved config if omitted. |
+| `--worker-model` | Default-tier model handling the bulk of calls (e.g. `openai/gpt-6-luna`). Uses saved config if omitted. |
+| `--architect-model` | Stronger model for planning/synthesis (e.g. `openai/gpt-6-sol`). Uses saved config if omitted. |
 | `--no-architect` | Skip the architect tier for this run; the worker handles every call. |
 | `--app-type` | Override the planner's detected app type (`analyze` only): `auto` (default), `web`, `genai`, `agentic`. |
-| `--max-llm-calls` | Cap total LLM calls across both tiers (`analyze` only; `0` = unlimited). |
-| `--max-tool-calls` | Cap total tool executions (`analyze` only; `0` = unlimited). |
+| `--max-llm-calls` | Cap LLM calls **per subsystem** (`analyze` only; default `25`, `0` = unlimited). Every subsystem gets the same budget and none is skipped for spending it: one that reaches the cap gets one final round to report what it found and is recorded `budget_exhausted`. The plan approval prompt shows the resulting ceiling for the whole run, `subsystems × (cap + 1) + 3` calls (synthesis may retry once, then the diagram). The interactive `/analyze` command uses the default. The default is about twice the measured reference: a complete 6-subsystem run against crAPI's identity service took about 11.8 exploration rounds per subsystem (71 exploration calls of 76 total). |
+| `--max-tool-calls` | Cap code-exploration calls **per subsystem** (`analyze` only; `0` = unlimited). As with `--max-llm-calls`, a subsystem that reaches the cap gets one final round to report what it found and is recorded `budget_exhausted`, so none is skipped. Reporting a threat doesn't spend it. |
 
 Each tier also accepts `--worker-api-key` / `--worker-api-base` / `--worker-max-tokens` (and the `--architect-*` equivalents). Run `stride-gpt analyze --help` or `stride-gpt quick --help` for the complete list.
 
@@ -449,8 +474,10 @@ Each tier also accepts `--worker-api-key` / `--worker-api-base` / `--worker-max-
 | File | Contents |
 |------|----------|
 | `<stem>.plan.json` | The `AnalysisPlan` the architect produced — subsystems, focus areas, detected app type (analyze only). |
-| `<stem>.findings.json` | Per-subsystem `SubsystemFinding` list, cross-cutting threats, and the system-level data flow diagram (analyze only). |
-| `<stem>.run.json` | A `RunManifest` — models, prompt + config hash, references the agent actually loaded, git SHA, version, timing. Emitted for both `analyze` and `quick`. |
+| `<stem>.findings.json` | Per-subsystem `SubsystemFinding` list, cross-cutting threats, and the system-level data flow diagram (analyze only). Every planned subsystem appears, each with an `outcome` saying why it stopped. |
+| `<stem>.run.json` | A `RunManifest` — models, prompt + config hash, references the agent actually loaded, git SHA, version, timing, and a `run_summary` whose `status` is `partial` when any subsystem crashed, returned nothing readable, or stopped without finishing. The summary also carries token usage for the run, broken down by phase (planning, exploration, compression, synthesis, DFD) and by subsystem; totals are `null` rather than `0` when a provider doesn't report usage. Emitted for both `analyze` and `quick`. |
+
+A subsystem's `outcome` is one of `completed`, `budget_exhausted` (the call or tool budget ran out and it reported in a final round), `parse_failed` (its closing answer couldn't be read), `unfinished` (it stopped without calling `finish` after reporting threats, which are kept), or `error` (it raised — see `error_class`). The first two count as analysed; the rest make the run `partial`, and the markdown and HTML reports say so under the affected subsystem.
 
 The format flag (`-f`) controls the report artefact only; the siblings are always JSON. File paths in the manifest and findings are redacted (`./…` when under the working directory, `~/…` when under `$HOME`) so a manifest is safe to share. The auto-archive at `~/.stride-gpt/reports/{analyze,quick}/` is unaffected — siblings are only emitted when you pass `-o`.
 
@@ -480,7 +507,9 @@ docker run -p 8501:8501 --env-file .env mrwadams/stridegpt
 
 ## Sample output
 
-Every `stride-gpt analyze` and `stride-gpt quick` run emits a markdown report by default (with JSON, SARIF, and a self-contained HTML view available via `-f`). The markdown groups threats by subsystem in STRIDE tables, adds a cross-cutting section for threats that span components, and closes with a run summary. Optional columns (OWASP LLM/ASI, Insider Category, MITRE ATT&CK) appear only when a run populates them.
+Every `stride-gpt analyze` and `stride-gpt quick` run emits a markdown report by default (with JSON, SARIF, and a self-contained HTML view available via `-f`). The markdown groups threats by subsystem in STRIDE tables, adds a cross-cutting section for threats that span components, and closes with a run summary. Optional columns (OWASP LLM/ASI, Insider Category, MITRE ATT&CK, Evidence) appear only when a run populates them.
+
+Threats from `analyze` cite the code they came from. The agent quotes a snippet, the snippet is matched against the file on disk, and the matched line range is recorded — so the Evidence column shows `app/auth/jwt.py:14-19`, the HTML report shows the quoted code, and each SARIF result points at those exact lines rather than at the subsystem's file list. A snippet that can't be found is marked unverified rather than dropped, so you can see what the model claimed and judge it.
 
 Below is the markdown from a run against a fictional payments API, so you can see the shape of the output before running the tool. It is a real render from the report engine, not a mock-up.
 
@@ -515,10 +544,10 @@ flowchart LR
 
 ### Threats
 
-| Threat Type | Scenario | Potential Impact | MITRE ATT&CK |
-|-------------|----------|------------------|--------------|
-| Spoofing | An attacker forges a JWT using a weak or leaked signing secret to impersonate another customer. | Full account takeover and unauthorized access to stored payment methods. | T1550.001 (Application Access Token) |
-| Elevation of Privilege | A standard user calls an admin-only refund endpoint that only checks authentication, not role. | Unauthorized refunds and financial loss. | T1068 (Exploitation for Privilege Escalation) |
+| Threat Type | Scenario | Potential Impact | MITRE ATT&CK | Evidence |
+|-------------|----------|------------------|--------------|----------|
+| Spoofing | An attacker forges a JWT using a weak or leaked signing secret to impersonate another customer. | Full account takeover and unauthorized access to stored payment methods. | T1550.001 (Application Access Token) | app/auth/jwt.py:14-19 |
+| Elevation of Privilege | A standard user calls an admin-only refund endpoint that only checks authentication, not role. | Unauthorized refunds and financial loss. | T1068 (Exploitation for Privilege Escalation) | app/auth/dependencies.py:31-38 |
 
 ### Recommendations
 
@@ -534,10 +563,10 @@ flowchart LR
 
 ### Threats
 
-| Threat Type | Scenario | Potential Impact | MITRE ATT&CK |
-|-------------|----------|------------------|--------------|
-| Information Disclosure | Full card numbers are logged in request debug logs when a payment fails. | PCI-DSS violation and exposure of cardholder data to anyone with log access. | T1552.001 (Credentials In Files) |
-| Tampering | The payment amount is taken from a client-supplied field and not re-validated server-side against the order. | A user pays less than the order total by editing the request body. |  |
+| Threat Type | Scenario | Potential Impact | MITRE ATT&CK | Evidence |
+|-------------|----------|------------------|--------------|----------|
+| Information Disclosure | Full card numbers are logged in request debug logs when a payment fails. | PCI-DSS violation and exposure of cardholder data to anyone with log access. | T1552.001 (Credentials In Files) | app/payments/routes.py:88-91 |
+| Tampering | The payment amount is taken from a client-supplied field and not re-validated server-side against the order. | A user pays less than the order total by editing the request body. |  | app/payments/routes.py:42-44 |
 
 ### Recommendations
 
@@ -557,8 +586,8 @@ flowchart LR
 - **Cross-cutting threats**: 1
 - **LLM calls**: 34
 - **Tool calls**: 58
-- **Architect model**: OpenAI API/gpt-5.4
-- **Worker model**: Groq API/llama-3.3-70b-versatile
+- **Architect model**: OpenAI API/gpt-6-sol
+- **Worker model**: OpenAI API/gpt-6-luna
 ````
 
 </details>
@@ -596,12 +625,10 @@ When you generate threat models, STRIDE GPT sends data to your chosen LLM provid
 - Generated threat models and mitigations
 
 **What this means:**
-- OpenAI, Groq, Mistral, DeepSeek, etc. may log this data per their privacy policies
+- OpenAI may log this data per its privacy policies
 - Consider using generic/fictional system details for demonstrations
-- Review your LLM provider's data retention and privacy policies
+- Review OpenAI's data retention and privacy policies
 - For sensitive systems, consider:
-  - Using local models (LM Studio)
-  - Using providers with stricter privacy guarantees
   - Sanitizing system descriptions before input
 
 ### For Team/Organization Deployments

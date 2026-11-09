@@ -20,6 +20,7 @@ from stride_gpt.core.schemas import (
     LLMConfig,
     ModelPair,
     SubsystemFinding,
+    TokenUsage,
 )
 
 # ---------------------------------------------------------------------------
@@ -62,6 +63,66 @@ def test_redact_path_outside_cwd_and_home(tmp_path, monkeypatch):
     monkeypatch.chdir(cwd)
     # Not under cwd, not under HOME — falls through to absolute path.
     assert redact_path(other) == str(other.resolve())
+
+
+def test_redact_path_null_byte_does_not_raise():
+    # Path.resolve() raises ValueError (not OSError) on an embedded null
+    # byte, e.g. one decoded from model output, so redact_path must catch
+    # broadly rather than propagate it (issue #208).
+    malformed = "a" + chr(0) + "b.py"
+    assert redact_path(malformed) == malformed
+
+
+def test_redact_path_unresolvable_under_home_is_still_redacted(tmp_path, monkeypatch):
+    # Catching broadly must not turn a crash into a leak: an unresolvable
+    # path under $HOME would otherwise be serialised verbatim, putting
+    # /Users/<name>/... into a manifest that goes to git and tickets.
+    home = tmp_path / "home"
+    cwd = tmp_path / "elsewhere"
+    (home / "proj").mkdir(parents=True)
+    cwd.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(cwd)
+    malformed = f"{home}/proj/a" + chr(0) + "b.py"
+    # The malformed tail survives — it is evidence of what the model
+    # emitted — but the home prefix does not.
+    assert redact_path(malformed) == "~/proj/a" + chr(0) + "b.py"
+    assert str(home) not in redact_path(malformed)
+
+
+def test_redact_path_unresolvable_under_cwd_is_still_redacted(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    cwd = tmp_path / "work"
+    home.mkdir()
+    cwd.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(cwd)
+    malformed = f"{cwd}/services/a" + chr(0) + "b.py"
+    assert redact_path(malformed) == "./services/a" + chr(0) + "b.py"
+
+
+def test_redact_path_unresolvable_cwd_wins_over_home(tmp_path, monkeypatch):
+    # A cwd nested inside $HOME must anchor to "./" on the textual path as
+    # well, matching the rule order applied to a resolved path.
+    home = tmp_path / "home"
+    cwd = home / "code" / "acme"
+    cwd.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(cwd)
+    malformed = f"{cwd}/a" + chr(0) + "b.py"
+    assert redact_path(malformed) == "./a" + chr(0) + "b.py"
+
+
+def test_redact_path_unresolvable_outside_both_anchors_is_verbatim(tmp_path, monkeypatch):
+    # Rule 3 on a string that could not be resolved: nothing to redact.
+    home = tmp_path / "home"
+    cwd = tmp_path / "cwd"
+    home.mkdir()
+    cwd.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(cwd)
+    malformed = "/etc/a" + chr(0) + "b.py"
+    assert redact_path(malformed) == malformed
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +273,7 @@ def test_write_intermediates_analyze_files_parse_as_models(
     assert "cross_cutting_threats" in findings_data
     assert "data_flow_diagram" in findings_data
     for f in findings_data["findings"]:
+        assert f["outcome"] == "completed"
         SubsystemFinding(**f)
 
     run_data = json.loads((tmp_path / "audit.run.json").read_text())
@@ -356,6 +418,13 @@ def test_run_manifest_round_trip():
 # ---------------------------------------------------------------------------
 
 
+def _findings_for(plan) -> list[SubsystemFinding]:
+    """One completed finding per planned subsystem — the all-clear baseline."""
+    return [
+        SubsystemFinding(subsystem=s.name, threats=[]) for s in plan.subsystems
+    ]
+
+
 def test_build_analyze_manifest_populates_expected_fields(
     tmp_path, monkeypatch, sample_plan, model_pair,
 ):
@@ -374,7 +443,7 @@ def test_build_analyze_manifest_populates_expected_fields(
         references_loaded=["genai"],
         llm_calls=5,
         tool_calls=12,
-        subsystems_analyzed=len(sample_plan.subsystems),
+        findings=_findings_for(sample_plan),
     )
 
     assert manifest.mode == "analyze"
@@ -389,6 +458,123 @@ def test_build_analyze_manifest_populates_expected_fields(
     # 64-char sha256 hex.
     assert len(manifest.config_hash) == 64
     int(manifest.config_hash, 16)
+
+
+def test_build_analyze_manifest_defaults_to_unavailable_usage(
+    tmp_path, monkeypatch, sample_plan, model_pair,
+):
+    """No ``token_usage_by_phase`` given (or no response in the run reported
+    usage) reads as unavailable, not a silent zero."""
+    monkeypatch.chdir(tmp_path)
+    manifest = build_analyze_manifest(
+        models=model_pair,
+        plan=sample_plan,
+        target=tmp_path,
+        started_at=datetime.now(UTC),
+        finished_at=datetime.now(UTC),
+        app_type_source="planner",
+        system_prompt="hello",
+        references_loaded=[],
+        llm_calls=5,
+        tool_calls=12,
+        findings=_findings_for(sample_plan),
+    )
+
+    assert manifest.run_summary.token_usage_total.available is False
+    assert manifest.run_summary.token_usage_total.total_tokens is None
+    assert manifest.run_summary.token_usage_by_phase == {}
+
+
+def test_build_analyze_manifest_records_token_usage_by_phase_and_subsystem(
+    tmp_path, monkeypatch, sample_plan, model_pair,
+):
+    monkeypatch.chdir(tmp_path)
+    findings = [
+        SubsystemFinding(
+            subsystem=sample_plan.subsystems[0].name, threats=[],
+            token_usage=TokenUsage(prompt_tokens=100, completion_tokens=10),
+        ),
+        SubsystemFinding(
+            subsystem=sample_plan.subsystems[1].name, threats=[],
+            token_usage=TokenUsage(prompt_tokens=200, completion_tokens=20),
+        ),
+    ]
+
+    manifest = build_analyze_manifest(
+        models=model_pair,
+        plan=sample_plan,
+        target=tmp_path,
+        started_at=datetime.now(UTC),
+        finished_at=datetime.now(UTC),
+        app_type_source="planner",
+        system_prompt="hello",
+        references_loaded=[],
+        llm_calls=5,
+        tool_calls=12,
+        findings=findings,
+        token_usage_by_phase={
+            "exploration": {"prompt_tokens": 300, "completion_tokens": 30},
+            "synthesis": {"prompt_tokens": 50, "completion_tokens": 5},
+            "planning": {"prompt_tokens": None, "completion_tokens": None},
+        },
+    )
+
+    summary = manifest.run_summary
+    assert summary.token_usage_total.available is True
+    assert summary.token_usage_total.prompt_tokens == 350
+    assert summary.token_usage_total.completion_tokens == 35
+    assert summary.token_usage_by_phase["exploration"] == TokenUsage(
+        prompt_tokens=300, completion_tokens=30,
+    )
+    assert summary.token_usage_by_phase["planning"].available is False
+    assert summary.token_usage_by_subsystem[sample_plan.subsystems[0].name].total_tokens == 110
+    assert summary.token_usage_by_subsystem[sample_plan.subsystems[1].name].total_tokens == 220
+
+
+def test_build_analyze_manifest_carries_the_cache_split(
+    tmp_path, monkeypatch, sample_plan, model_pair,
+):
+    monkeypatch.chdir(tmp_path)
+    findings = [
+        SubsystemFinding(
+            subsystem=sample_plan.subsystems[0].name, threats=[],
+            token_usage=TokenUsage(
+                prompt_tokens=100, completion_tokens=10,
+                cached_prompt_tokens=70, uncached_prompt_tokens=30,
+            ),
+        ),
+    ]
+
+    manifest = build_analyze_manifest(
+        models=model_pair,
+        plan=sample_plan,
+        target=tmp_path,
+        started_at=datetime.now(UTC),
+        finished_at=datetime.now(UTC),
+        app_type_source="planner",
+        system_prompt="hello",
+        references_loaded=[],
+        llm_calls=2,
+        tool_calls=0,
+        findings=findings,
+        token_usage_by_phase={
+            "exploration": {
+                "prompt_tokens": 100, "completion_tokens": 10,
+                "cached_prompt_tokens": 70, "uncached_prompt_tokens": 30,
+            },
+            # A run.json written before the split existed has no cache keys.
+            "dfd": {"prompt_tokens": 20, "completion_tokens": 2},
+        },
+    )
+
+    dumped = json.loads(manifest.model_dump_json())["run_summary"]
+    assert dumped["token_usage_by_phase"]["exploration"]["cached_prompt_tokens"] == 70
+    assert dumped["token_usage_by_phase"]["dfd"]["cached_prompt_tokens"] is None
+    assert dumped["token_usage_by_subsystem"][sample_plan.subsystems[0].name][
+        "uncached_prompt_tokens"
+    ] == 30
+    assert dumped["token_usage_total"]["cached_prompt_tokens"] == 70
+    assert dumped["token_usage_total"]["prompt_tokens"] == 120
 
 
 def test_build_analyze_manifest_status_completed_when_all_subsystems_analyzed(
@@ -406,7 +592,7 @@ def test_build_analyze_manifest_status_completed_when_all_subsystems_analyzed(
         references_loaded=[],
         llm_calls=5,
         tool_calls=12,
-        subsystems_analyzed=len(sample_plan.subsystems),
+        findings=_findings_for(sample_plan),
     )
 
     assert manifest.run_summary.status == "completed"
@@ -416,11 +602,14 @@ def test_build_analyze_manifest_status_completed_when_all_subsystems_analyzed(
     assert manifest.run_summary.tool_calls == 12
 
 
-def test_build_analyze_manifest_status_partial_when_cap_truncates(
+def test_build_analyze_manifest_is_completed_when_a_subsystem_took_the_grace_round(
     tmp_path, monkeypatch, sample_plan, model_pair,
 ):
-    # A call cap stopped analysis after 1 of the plan's 2 subsystems.
+    """A final round still analysed the code, so the run isn't partial."""
     monkeypatch.chdir(tmp_path)
+    findings = _findings_for(sample_plan)
+    findings[0] = findings[0].model_copy(update={"outcome": "budget_exhausted"})
+
     manifest = build_analyze_manifest(
         models=model_pair,
         plan=sample_plan,
@@ -430,14 +619,60 @@ def test_build_analyze_manifest_status_partial_when_cap_truncates(
         app_type_source="planner",
         system_prompt="hello",
         references_loaded=[],
-        llm_calls=8,
-        tool_calls=8,
-        subsystems_analyzed=1,
+        llm_calls=5,
+        tool_calls=12,
+        findings=findings,
+    )
+
+    assert manifest.run_summary.status == "completed"
+    assert manifest.run_summary.subsystems_analyzed == 2
+    assert manifest.run_summary.subsystem_outcomes == {
+        "budget_exhausted": 1, "completed": 1,
+    }
+
+
+def test_build_analyze_manifest_is_partial_when_a_subsystem_crashed(
+    tmp_path, monkeypatch, sample_plan, model_pair,
+):
+    """The count used to be of findings recorded, so a crash read as complete."""
+    monkeypatch.chdir(tmp_path)
+    findings = _findings_for(sample_plan)
+    findings[0] = findings[0].model_copy(
+        update={"outcome": "error", "error_class": "context_overflow"}
+    )
+
+    manifest = build_analyze_manifest(
+        models=model_pair,
+        plan=sample_plan,
+        target=tmp_path,
+        started_at=datetime.now(UTC),
+        finished_at=datetime.now(UTC),
+        app_type_source="planner",
+        system_prompt="hello",
+        references_loaded=[],
+        llm_calls=5,
+        tool_calls=12,
+        findings=findings,
     )
 
     assert manifest.run_summary.status == "partial"
-    assert manifest.run_summary.subsystems_planned == 2
     assert manifest.run_summary.subsystems_analyzed == 1
+    assert manifest.run_summary.subsystem_outcomes == {"completed": 1, "error": 1}
+
+
+def test_findings_json_written_before_outcomes_existed_still_loads():
+    """Pre-change files have no outcome key; they had reached the subsystem."""
+    legacy = {
+        "subsystem": "Auth",
+        "threats": [{"Threat Type": "Spoofing"}],
+        "improvement_suggestions": [],
+        "files_analyzed": ["./auth.py"],
+    }
+
+    finding = SubsystemFinding(**legacy)
+
+    assert finding.outcome == "completed"
+    assert finding.error_class is None
 
 
 def test_build_quick_manifest_uses_target_label_verbatim(model_pair):
@@ -481,3 +716,159 @@ def test_build_quick_manifest_run_summary_completed_with_null_subsystems(model_p
     assert manifest.run_summary.subsystems_analyzed is None
     assert manifest.run_summary.llm_calls == 4
     assert manifest.run_summary.tool_calls == 2
+
+
+def test_evidence_paths_are_redacted_without_mutating_the_report(
+    tmp_path, monkeypatch, sample_plan
+):
+    """The -o siblings redact; the auto-saved archive keeps verbatim values.
+
+    model_copy is shallow, so redacting a path nested inside a threat dict
+    in place would corrupt the report still held in memory.
+    """
+    monkeypatch.chdir(tmp_path)
+    cited = tmp_path / "src" / "auth.py"
+    cited.parent.mkdir(parents=True)
+    cited.write_text("# auth")
+    absolute = str(cited.resolve())
+
+    threat = {
+        "Threat Type": "Spoofing",
+        "Scenario": "s",
+        "Potential Impact": "i",
+        "evidence": [
+            {"path": absolute, "snippet": "# auth", "verified": True,
+             "start_line": 1, "end_line": 1}
+        ],
+    }
+    finding = SubsystemFinding(subsystem="Auth", threats=[threat], files_analyzed=[absolute])
+
+    output = tmp_path / "report.md"
+    output.write_text("ignored")
+    write_intermediates(
+        output,
+        manifest=_make_analyze_manifest(tmp_path),
+        plan=sample_plan,
+        findings=[finding],
+        cross_cutting=[],
+        data_flow_diagram=None,
+    )
+
+    on_disk = json.loads((tmp_path / "report.findings.json").read_text())
+    assert on_disk["findings"][0]["threats"][0]["evidence"][0]["path"] == "./src/auth.py"
+    assert threat["evidence"][0]["path"] == absolute
+
+
+def test_threats_without_evidence_pass_through_redaction(tmp_path, monkeypatch, sample_plan):
+    monkeypatch.chdir(tmp_path)
+    threat = {"Threat Type": "Spoofing", "Scenario": "s", "Potential Impact": "i"}
+    output = tmp_path / "report.md"
+    output.write_text("ignored")
+    write_intermediates(
+        output,
+        manifest=_make_analyze_manifest(tmp_path),
+        plan=sample_plan,
+        findings=[SubsystemFinding(subsystem="Auth", threats=[threat])],
+        cross_cutting=[],
+        data_flow_diagram=None,
+    )
+    on_disk = json.loads((tmp_path / "report.findings.json").read_text())
+    assert on_disk["findings"][0]["threats"] == [threat]
+
+
+def test_build_analyze_manifest_records_dropped_synthesis_items(
+    tmp_path, monkeypatch, sample_plan, model_pair,
+):
+    """A run whose synthesis items were all dropped differs in run.json from
+    one where synthesis returned nothing (#252)."""
+    monkeypatch.chdir(tmp_path)
+    kwargs = {
+        "models": model_pair,
+        "plan": sample_plan,
+        "target": tmp_path,
+        "started_at": datetime.now(UTC),
+        "finished_at": datetime.now(UTC),
+        "app_type_source": "planner",
+        "system_prompt": "hello",
+        "references_loaded": [],
+        "llm_calls": 5,
+        "tool_calls": 12,
+        "findings": _findings_for(sample_plan),
+    }
+    drops = [{"item": "aggregation 'Spoofing'", "reason": "it links to no known threat id"}]
+
+    dropped = build_analyze_manifest(**kwargs, synthesis_dropped=drops).run_summary
+    empty = build_analyze_manifest(**kwargs).run_summary
+
+    assert dropped.synthesis_items_dropped == 1
+    assert dropped.synthesis_dropped == drops
+    assert empty.synthesis_items_dropped == 0
+    assert empty.synthesis_dropped == []
+
+
+# ---------------------------------------------------------------------------
+# Key-file truncation in run.json (issue #175)
+# ---------------------------------------------------------------------------
+
+
+def _run_json_for_tree(tmp_path, monkeypatch, model_pair, file_count: int) -> dict:
+    from unittest.mock import patch
+
+    from stride_gpt.agent.planner import create_plan
+    from stride_gpt.core.schemas import LLMResponse
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "repo"
+    target.mkdir()
+    for i in range(file_count):
+        (target / f"f{i:03d}.py").write_text("x\n")
+    response = LLMResponse(
+        content=json.dumps({"overall_description": "Test", "subsystems": [{"name": "App"}]}),
+    )
+    with patch("stride_gpt.agent.planner.call_llm", return_value=response):
+        plan = create_plan(model_pair.worker, target)
+
+    manifest = build_analyze_manifest(
+        models=model_pair,
+        plan=plan,
+        target=target,
+        started_at=datetime.now(UTC),
+        finished_at=datetime.now(UTC),
+        app_type_source="planner",
+        system_prompt="hello",
+        references_loaded=[],
+        llm_calls=1,
+        tool_calls=0,
+        findings=_findings_for(plan),
+    )
+    output = tmp_path / "report.md"
+    write_intermediates(output, manifest=manifest, plan=plan, findings=[])
+    return json.loads((tmp_path / "report.run.json").read_text())["run_summary"]
+
+
+def test_run_json_records_key_file_truncation(tmp_path, monkeypatch, model_pair):
+    from stride_gpt.agent.planner import KEY_FILE_SAMPLE_LIMIT
+
+    summary = _run_json_for_tree(tmp_path, monkeypatch, model_pair, KEY_FILE_SAMPLE_LIMIT + 10)
+    assert summary["key_files_found"] == KEY_FILE_SAMPLE_LIMIT + 10
+    assert summary["key_files_shown"] == KEY_FILE_SAMPLE_LIMIT
+
+
+def test_run_json_records_equal_counts_under_the_limit(tmp_path, monkeypatch, model_pair):
+    summary = _run_json_for_tree(tmp_path, monkeypatch, model_pair, 5)
+    assert summary["key_files_found"] == summary["key_files_shown"] == 5
+
+
+def test_quick_manifest_has_no_key_file_counts(model_pair):
+    summary = _make_quick_manifest().run_summary
+    assert summary.key_files_found is None
+    assert summary.key_files_shown is None
+
+
+def test_run_json_written_before_key_file_counts_still_loads(tmp_path):
+    data = json.loads(_make_analyze_manifest(tmp_path).model_dump_json())
+    del data["run_summary"]["key_files_found"]
+    del data["run_summary"]["key_files_shown"]
+    manifest = RunManifest(**data)
+    assert manifest.run_summary.key_files_found is None
+    assert manifest.run_summary.key_files_shown is None

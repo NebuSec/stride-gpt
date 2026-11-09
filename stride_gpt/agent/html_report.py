@@ -14,7 +14,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from stride_gpt.core.report_utils import mitre_url, normalize_mitre_techniques
+from stride_gpt.core.report_utils import (
+    SYSTEMIC_OBSERVATIONS_NOTE,
+    evidence_items,
+    evidence_location,
+    mitre_url,
+    normalize_mitre_techniques,
+    outcome_note,
+    related_threat_labels,
+)
 from stride_gpt.core.schemas import AnalysisReport
 
 # STRIDE category → Tailwind badge classes. Six categories carry distinct
@@ -68,10 +76,13 @@ def render_html(report: AnalysisReport) -> str:
                 "threats": f.threats,
                 "improvement_suggestions": f.improvement_suggestions,
                 "files_analyzed": f.files_analyzed,
+                "outcome": f.outcome,
+                "error_class": f.error_class,
             }
             for f in report.findings
         ],
         "cross_cutting_threats": report.cross_cutting_threats,
+        "systemic_observations": report.systemic_observations,
         "metadata": report.metadata,
     }
     return render_html_from_json(data)
@@ -90,6 +101,7 @@ def render_html_from_json(data: dict[str, Any]) -> str:
     dfd_mermaid = (data.get("data_flow_diagram") or "").strip()
     subsystems = data.get("subsystems") or []
     cross_cutting = data.get("cross_cutting_threats") or []
+    systemic = data.get("systemic_observations") or []
     metadata = data.get("metadata") or {}
 
     total_threats = sum(len(s.get("threats") or []) for s in subsystems)
@@ -103,6 +115,8 @@ def render_html_from_json(data: dict[str, Any]) -> str:
         total_threats=total_threats,
         subsystem_count=len(subsystems),
         cross_cutting_count=len(cross_cutting),
+        systemic_count=len(systemic),
+        synthesis_dropped_count=len(metadata.get("synthesis_dropped") or []),
     ))
 
     if overview:
@@ -115,6 +129,9 @@ def render_html_from_json(data: dict[str, Any]) -> str:
 
     if cross_cutting:
         parts.append(_render_cross_cutting(cross_cutting))
+
+    if systemic:
+        parts.append(_render_systemic_observations(systemic, subsystems))
 
     parts.append(_render_footer(metadata))
 
@@ -158,6 +175,8 @@ def _render_header(
     total_threats: int,
     subsystem_count: int,
     cross_cutting_count: int,
+    systemic_count: int = 0,
+    synthesis_dropped_count: int = 0,
 ) -> str:
     model_line = _format_model_line(metadata)
     chip = (
@@ -175,6 +194,21 @@ def _render_header(
     if cross_cutting_count:
         summary_chips.append(
             f'<span class="{chip}">{cross_cutting_count} cross-cutting</span>'
+        )
+    if systemic_count:
+        summary_chips.append(
+            f'<span class="{chip}">{systemic_count} systemic observations</span>'
+        )
+    synthesis_error_class = metadata.get("synthesis_error_class")
+    if isinstance(synthesis_error_class, str) and synthesis_error_class:
+        summary_chips.append(
+            f'<span class="{chip}">Synthesis failed ({html.escape(synthesis_error_class)})</span>'
+        )
+    # Otherwise a run whose every synthesis item was dropped reads the same as
+    # one where synthesis genuinely found nothing.
+    if synthesis_dropped_count:
+        summary_chips.append(
+            f'<span class="{chip}">{synthesis_dropped_count} synthesis items dropped</span>'
         )
 
     meta_line_parts: list[str] = []
@@ -240,12 +274,43 @@ def _render_footer(metadata: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+# A subsystem that didn't finish is a caveat about the report, not a threat
+# category — so it reads as a bordered callout rather than another round chip.
+# Every Tailwind hue is already spoken for by the six STRIDE badges, and a
+# seventh pill would compete with the one signal the page is built around.
+_OUTCOME_CALLOUT = (
+    "rounded-r border-l-4 border-amber-400 bg-amber-50/60 px-3 py-2 text-sm "
+    "text-amber-900"
+)
+
+
+def _render_outcome_callout(outcome: str, error_class: str | None) -> str:
+    """Why a subsystem didn't complete, or "" when it did.
+
+    Reports that show only threats make a crashed subsystem indistinguishable
+    from a clean one, which is the whole point of recording the outcome.
+    """
+    note = outcome_note(outcome, error_class)
+    if note is None:
+        return ""
+    label = outcome.replace("_", " ")
+    return (
+        f'        <p class="{_OUTCOME_CALLOUT}">'
+        f"<span class=\"font-medium\">{html.escape(label)}</span> — "
+        f"{html.escape(note)}.</p>"
+    )
+
+
 def _render_subsystem(sub: dict[str, Any]) -> str:
     name = sub.get("name") or "(unnamed)"
     description = (sub.get("description") or "").strip()
     files = sub.get("files_analyzed") or []
     threats = sub.get("threats") or []
     suggestions = sub.get("improvement_suggestions") or []
+    # Reports saved before outcomes existed have no key; anything written out
+    # at all had been analysed.
+    outcome = sub.get("outcome") or "completed"
+    callout = _render_outcome_callout(outcome, sub.get("error_class"))
 
     parts: list[str] = []
     parts.append(f"""        <header class="space-y-1">
@@ -256,6 +321,9 @@ def _render_subsystem(sub: dict[str, Any]) -> str:
         )
     parts.append("        </header>")
 
+    if callout:
+        parts.append(callout)
+
     if files:
         parts.append(_render_files_analyzed(files))
 
@@ -264,7 +332,7 @@ def _render_subsystem(sub: dict[str, Any]) -> str:
         parts.append(f"""        <div class="space-y-4">
 {cards}
         </div>""")
-    else:
+    elif outcome == "completed":
         parts.append(
             '        <p class="text-sm italic text-slate-500">No threats identified.</p>'
         )
@@ -289,6 +357,56 @@ def _render_cross_cutting(threats: list[dict[str, Any]]) -> str:
 {cards}
         </div>
       </section>"""
+
+
+def _render_systemic_observations(
+    observations: list[dict[str, Any]], subsystems: list[dict[str, Any]]
+) -> str:
+    pairs = [(sub.get("name") or "", sub.get("threats") or []) for sub in subsystems]
+    cards = "\n".join(_render_observation_card(o, pairs) for o in observations)
+    return f"""      <section id="systemic-observations" class="space-y-5">
+        <header class="space-y-1">
+          <h2 class="text-xl font-semibold tracking-tight text-slate-900">Systemic observations</h2>
+          <p class="text-sm text-slate-600">{html.escape(SYSTEMIC_OBSERVATIONS_NOTE)}</p>
+        </header>
+        <div class="space-y-4">
+{cards}
+        </div>
+      </section>"""
+
+
+def _render_observation_card(
+    observation: dict[str, Any], subsystems: list[tuple[str, list[dict[str, Any]]]]
+) -> str:
+    threat_type = observation.get("Threat Type") or "Unknown"
+    badge_classes = _STRIDE_BADGE_CLASSES.get(threat_type, _DEFAULT_BADGE)
+    rows: list[str] = []
+    if observation.get("Scenario"):
+        rows.append(_dl_row("Observation", html.escape(str(observation["Scenario"]))))
+    if observation.get("Potential Impact"):
+        rows.append(_dl_row("Potential impact", html.escape(str(observation["Potential Impact"]))))
+    affected = observation.get("Affected Subsystems") or []
+    if affected:
+        pills = "".join(
+            f'<span class="{_PILL_BASE}">{html.escape(str(a))}</span> ' for a in affected
+        )
+        rows.append(_dl_row("Affects", f'<div class="flex flex-wrap gap-1">{pills}</div>'))
+    links = related_threat_labels(observation, subsystems)
+    if links:
+        items = "".join(
+            f'<li><span class="font-mono text-xs">{html.escape(tid)}</span>'
+            + (f" &mdash; {html.escape(label)}" if label else "")
+            + "</li>"
+            for tid, label in links
+        )
+        rows.append(_dl_row("Summarises", f'<ul class="list-disc pl-5 space-y-1">{items}</ul>'))
+    body = "\n".join(rows)
+    return f"""          <article class="rounded-lg border border-dashed border-slate-300 bg-white p-5 space-y-3">
+            <div class="flex flex-wrap gap-2"><span class="{_BADGE_BASE} {badge_classes}">{html.escape(str(threat_type))}</span></div>
+            <dl class="space-y-3">
+{body}
+            </dl>
+          </article>"""
 
 
 def _render_files_analyzed(files: list[str]) -> str:
@@ -351,6 +469,8 @@ def _render_threat_card(threat: dict[str, Any], *, cross_cutting: bool) -> str:
         rows.append(_dl_row("Scenario", html.escape(scenario)))
     if impact:
         rows.append(_dl_row("Potential impact", html.escape(impact)))
+    if evidence_items(threat):
+        rows.append(_dl_row("Evidence", _render_evidence(threat)))
     if cross_cutting and affected:
         pills = "".join(
             f'<span class="{_PILL_BASE}">{html.escape(str(a))}</span> '
@@ -398,6 +518,38 @@ def _render_mitre_pills(value: Any) -> list[str]:
                 f'{html.escape(tid)}</span>'
             )
     return pills
+
+
+def _render_evidence(threat: dict[str, Any]) -> str:
+    """The code a threat cites, with the line range the snippet matched.
+
+    An unverified item is shown, not hidden: the snippet is still what the
+    model based the threat on, and saying we couldn't find it is more useful
+    than dropping it silently.
+    """
+    rows: list[str] = []
+    for item in evidence_items(threat):
+        location = html.escape(evidence_location(item))
+        snippet = html.escape(str(item.get("snippet") or ""))
+        occurrences = item.get("occurrences")
+        if not item.get("verified"):
+            flag = f' <span class="{_PILL_BASE}">unverified</span>'
+        elif isinstance(occurrences, int) and occurrences > 1:
+            # The range is the first match; say so rather than imply it is
+            # the only one.
+            flag = f' <span class="{_PILL_BASE}">{occurrences} matches</span>'
+        else:
+            flag = ""
+        rows.append(
+            f"""                <li>
+                  <div class="font-mono text-xs text-slate-600">{location}{flag}</div>
+                  <pre class="mt-1 overflow-x-auto rounded bg-slate-50 p-2 text-xs \
+font-mono text-slate-800"><code>{snippet}</code></pre>
+                </li>"""
+        )
+    return f"""<ul class="space-y-2">
+{chr(10).join(rows)}
+              </ul>"""
 
 
 def _dl_row(label: str, value_html: str) -> str:

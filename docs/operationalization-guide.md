@@ -18,7 +18,6 @@ Both paths generate threat models using LLMs; both are customizable for your org
 | Codebase-aware analysis driven from source control or CI | CLI (`/analyze`) |
 | One-off threat model from a written description in a terminal | CLI (`/quick`) |
 | SARIF imports into GitHub / GitLab / Azure DevOps / IDEs | CLI (any command) |
-| Air-gapped deployment with on-prem LLM (LM Studio) | CLI |
 | Browser UI for analysts who don't live in the terminal | Streamlit |
 | Architecture diagram / flowchart upload as input | Streamlit (multi-modal) |
 | DREAD scoring, attack trees, Gherkin tests | Streamlit (until equivalents land in the CLI) |
@@ -63,8 +62,6 @@ flowchart TD
     A[User Input] -->|App description,<br/>diagram, or<br/>GitHub repo| B[Prompt Builder]
     B -->|apps/web/threat_model.py<br/>apps/web/mitigations.py<br/>etc.| C{LLM Provider}
     C -->|OpenAI| D[JSON Response]
-    C -->|Mistral/Groq/DeepSeek| D
-    C -->|LM Studio| D
     D --> E[Markdown Converter]
     E --> F[Display Results]
 
@@ -162,7 +159,7 @@ Organizational Context:
 ### Prerequisites
 - Python 3.12+ installed
 - `pip install stride-gpt` (or an editable install from a fork if you want to commit cards back to source)
-- An API key for at least one LLM provider, or a running LM Studio endpoint
+- An OpenAI API key
 
 ### Step 1: Identify Your Card's Trigger
 
@@ -242,10 +239,10 @@ Use the existing `mitre_enterprise.md` or `insider_threat.md` as a structural te
 ### Step 3: Verify the Agent Picks It Up
 
 ```bash
-stride-gpt /quick -i some_description.txt -f json -o /tmp/test.json
+stride-gpt quick -i some_description.txt -o /tmp/test.md
 ```
 
-In the output's `metadata.tools_used` block, you should see `load_reference` invoked with `name: myorg`. If it isn't, the trigger isn't matching — broaden the `when_to_load` language or add explicit examples of the subsystem types that should pull the card.
+The run writes a `/tmp/test.run.json` sibling next to the report. Its `references_loaded` list names every card the agent loaded, so you should see `myorg` there. If you don't, the trigger isn't matching — broaden the `when_to_load` language or add explicit examples of the subsystem types that should pull the card.
 
 ### Step 4: Test the Output
 
@@ -374,7 +371,7 @@ Large organizational context can consume tokens. Best practices:
 - **Optimize over time** - Add more detail based on actual usage patterns
 - **Conditional loading** - Load different context based on application type (web, mobile, API)
 
-Modern LLMs (GPT-5.2, Claude Sonnet 4.5, Gemini 3) have 200k–1M token context windows, so most organizational contexts fit comfortably.
+Modern LLMs (the GPT-6 series) have 200k–1M token context windows, so most organizational contexts fit comfortably.
 
 ---
 
@@ -447,8 +444,8 @@ Potential Impact: Data breach exposing Confidential customer data, SOC2 complian
 
 ```bash
 pip install stride-gpt
-stride-gpt /analyze ./my-codebase -o threat-model.html -f html
-stride-gpt /quick -i app-description.txt -f sarif -o threats.sarif
+stride-gpt analyze ./my-codebase -o threat-model.html -f html
+stride-gpt quick -i app-description.txt -f html -o threats.html
 ```
 
 Install into a per-user venv on shared workstations, into a base image for build agents, or into a project-local `uv` environment for repo-specific use. No daemon, no port, no surface to defend — just a Python entrypoint.
@@ -468,13 +465,17 @@ jobs:
     permissions:
       security-events: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          # stride-gpt doesn't need git credentials; don't leave the job
+          # token where the checked-out code (and the agent) can reach it.
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v3
       - run: uv tool install stride-gpt
       - name: Generate threat model
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: stride-gpt /analyze . -o threats.sarif -f sarif
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: stride-gpt analyze . --worker-model openai/gpt-6-sol --yes -o threats.sarif -f sarif
       - name: Upload SARIF
         uses: github/codeql-action/upload-sarif@v3
         with:
@@ -484,24 +485,6 @@ jobs:
 This surfaces threats in the **Security → Code scanning** tab of the repo and on PR diff views. Cost-control tip: gate the workflow on `paths-filter` so it only runs when affected subsystems change, and use a smaller `worker_model` for incremental analyses.
 
 GitLab, Azure DevOps, and Bitbucket all support SARIF ingestion via similar steps — the upload mechanics differ but the SARIF file is the same.
-
-#### Option 3: Air-Gapped / On-Prem LLM
-
-For organizations that can't send code or descriptions to a third-party API, run the CLI against a local LM Studio (or any OpenAI-compatible) endpoint:
-
-```bash
-# Set up LM Studio with a capable model (Llama 3.3 70B Instruct, Qwen 2.5 Coder 32B,
-# DeepSeek R1 distill, etc.) and start the server on localhost:1234
-
-export LMSTUDIO_BASE_URL=http://lmstudio.internal:1234/v1
-stride-gpt /config  # select LM Studio as the provider
-stride-gpt /analyze ./my-codebase
-```
-
-Notes for air-gapped deployments:
-- Reference-card refresh (`scripts/refresh_mitre_cards.py`) pulls from `mitre/cti` and `mitre-atlas/atlas-data` — run it on a connected build host, then ship the regenerated cards in your internal mirror
-- Tool-using agents benefit from large-context models; under-resourced local models will produce thinner threat models than frontier APIs
-- The CLI never writes to network sockets other than the configured LLM endpoint — straightforward to audit
 
 ### Streamlit UI Deployment
 
@@ -579,9 +562,8 @@ docker run -p 8501:8501 \
 ```
 
 **API Keys needed:**
-- LLM provider keys (OpenAI, Groq, Mistral, DeepSeek, etc.)
+- OpenAI API key
 - Optional: GitHub token for repository analysis
-- Optional: LM Studio endpoint for local models
 
 #### Option D: Kubernetes (Enterprise)
 
@@ -678,7 +660,7 @@ flowchart TD
 
 **Solutions:**
 1. Reduce context size - keep only essential information
-2. Use a model with larger context window (GPT-4, Claude Opus)
+2. Use a model with a larger context window
 3. Test with simpler app descriptions first
 4. Check that your context doesn't include unescaped JSON characters
 
@@ -803,7 +785,7 @@ This is useful for quick pilots or when you can't deploy a modified version.
 **CLI path:**
 1. `pip install stride-gpt` on a test box
 2. Drop your `myorg.md` into `stride_gpt/core/prompts/threat_model/` (or your overlay)
-3. Run `stride-gpt /quick` on 3-5 representative applications
+3. Run `stride-gpt quick` on 3-5 representative applications
 4. Confirm the agent loads the card and threats cite your controls
 5. Validate output with your security team
 
@@ -816,10 +798,9 @@ This is useful for quick pilots or when you can't deploy a modified version.
 
 ### Week 3: Expand and Deploy
 **CLI path:**
-1. Add a CI/CD workflow that runs `stride-gpt /analyze . -f sarif` on pull requests
+1. Add a CI/CD workflow that runs `stride-gpt analyze . -f sarif` on pull requests
 2. Wire SARIF upload to GitHub/GitLab/Azure DevOps code scanning
-3. (Optional) Stand up an LM Studio endpoint for air-gapped use
-4. Document the workflow for engineering teams
+3. Document the workflow for engineering teams
 
 **Streamlit path:**
 1. Update `apps/web/mitigations.py`, `apps/web/dread.py`, and other modules
@@ -839,14 +820,12 @@ This is useful for quick pilots or when you can't deploy a modified version.
 ## FAQs
 
 ### Q: Can I use this with local/private LLMs?
-**A:** Yes — both paths support LM Studio (or any OpenAI-compatible endpoint) for on-premises deployment, useful for organizations with data privacy requirements. CLI: run `stride-gpt /config` and pick LM Studio as the provider; or set `LMSTUDIO_BASE_URL` directly. Streamlit UI: select "LM Studio" from the provider dropdown. See [Option 3: Air-Gapped / On-Prem LLM](#option-3-air-gapped--on-prem-llm) above for the CLI flow.
+**A:** Not currently. This fork calls OpenAI directly through the Responses API.
 
 ### Q: How much context is too much?
 **A:** Monitor token usage. Current model context windows (2025):
 - **GPT-5**: 272k input tokens (400k total)
-- **Claude Sonnet 4.5**: 200k tokens (1M with extended context)
 - **GPT-4o**: 128k tokens
-- Local models (LM Studio): Typically 4-32k tokens
 
 For organizational context, aim for 10-20k tokens (20-30 controls + 2-3 architectures). This leaves room for application descriptions and responses while staying well within modern model limits.
 
@@ -866,7 +845,7 @@ Be careful with merge conflicts in files you've modified (`apps/web/threat_model
 **A:** Yes, STRIDE-GPT supports reasoning models. They already handle context well, so organizational context injection works the same way. Note that reasoning models use more tokens, so monitor your context size.
 
 ### Q: Can I automate threat model generation in CI/CD?
-**A:** Yes — that's the CLI's primary use case. `stride-gpt /analyze . -o threats.sarif -f sarif` produces SARIF 2.1.0, which GitHub, GitLab, Azure DevOps, and Bitbucket all ingest as code-scanning findings. See the [CI/CD Integration](#option-2-cicd-integration-sarif) section above for a GitHub Actions example. Cost-wise, gate the workflow on path filters (only re-run when affected subsystems change) and use a smaller `worker_model` for incremental analyses.
+**A:** Yes — that's the CLI's primary use case. `stride-gpt analyze . -o threats.sarif -f sarif` produces SARIF 2.1.0, which GitHub, GitLab, Azure DevOps, and Bitbucket all ingest as code-scanning findings. See the [CI/CD Integration](#option-2-cicd-integration-sarif) section above for a GitHub Actions example. Cost-wise, gate the workflow on path filters (only re-run when affected subsystems change) and use a smaller `worker_model` for incremental analyses.
 
 ### Q: Should I prefer the CLI or the Streamlit UI for my organization?
 **A:** Default to the CLI. It scripts cleanly, integrates with CI/CD via SARIF, supports air-gapped LLMs, and has a cleaner customization surface (drop-in reference cards rather than forking prompt files). The Streamlit UI is the better choice when analysts need a browser experience, want to upload architecture diagrams as input, or use features that haven't been ported to the CLI yet (DREAD scoring, attack trees, Gherkin test cases). Both paths can coexist — many orgs run the CLI in CI and the Streamlit UI internally for analyst sessions.

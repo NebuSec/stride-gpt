@@ -2,26 +2,51 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from rich.console import Console
 
 from stride_gpt.agent.context import ContextManager
+from stride_gpt.agent.errors import classify_error
+from stride_gpt.agent.evidence import (
+    EvidenceCheck,
+    normalise_path,
+    summarise_checks,
+    verify_evidence,
+)
 from stride_gpt.agent.planner import create_plan, format_plan_for_display
 from stride_gpt.agent.progress import ProgressCallback, RichProgress
-from stride_gpt.agent.tools import AGENT_TOOLS, execute_tool
+from stride_gpt.agent.tools import (
+    REPORTING_TOOL_NAMES,
+    REPORTING_TOOLS,
+    SUBSYSTEM_TOOLS,
+    THREAT_ARG_TO_FIELD,
+    execute_tool,
+)
 from stride_gpt.core.json_extract import extract_json_object
 from stride_gpt.core.llm import call_llm, call_llm_with_tools
 from stride_gpt.core.prompts import base_system_prompt
 from stride_gpt.core.schemas import (
+    ANALYSED_OUTCOMES,
     AnalysisPlan,
     AnalysisReport,
     LLMConfig,
     ModelPair,
+    Subsystem,
     SubsystemFinding,
+    SubsystemOutcome,
+    TokenUsage,
+    ToolCallResult,
+    count_analysed,
+    count_outcomes,
 )
+
+logger = logging.getLogger(__name__)
 
 # The agent's system prompt is the packaged `base.md` reference. It points
 # the agent at `list_references` for runtime card discovery and
@@ -33,33 +58,65 @@ AGENT_SYSTEM_PROMPT = base_system_prompt()
 
 SYNTHESIS_PROMPT = """You are a security architect reviewing threat model findings from multiple subsystems.
 
-Below are the per-subsystem STRIDE threat findings. Identify cross-cutting threats that span multiple subsystems — for example:
-- Inconsistent authentication across subsystems
-- Missing encryption for data flowing between components
-- Shared secrets or credentials
-- Common input validation gaps
+Below are the per-subsystem STRIDE threat findings. Each threat has an "id", and its "evidence" (if any) is code that was checked against the repository.
+
+Report what spans subsystems. Every item you output is one of two kinds, and you must say which:
+
+1. "aggregation" — the same kind of weakness, reported separately by several subsystems, restated as a systemic pattern. Example: three subsystems each report missing authentication, so you note that the system has no authentication anywhere. An aggregation adds no new finding; it tells the reader the existing ones are systemic. It must list the ids of the subsystem threats it summarises in "Related Threats". It carries no evidence.
+
+2. "emergent" — a threat that exists only in the interaction between subsystems. Either each component looks fine on its own, or weaknesses in different subsystems combine into an attack path that no single subsystem reported as a whole. Example: one subsystem writes user-supplied file names into a shared directory, and another runs every script it finds there, so together they give an outside user code execution in the second. It must cite "evidence": code that shows the weakness, copied exactly from the evidence in the findings below. Do not invent snippets or cite code you were not shown. If you cannot cite evidence for it, do not report it.
+
+A chain whose steps different subsystems reported separately is emergent, not an aggregation: the path from one subsystem into another is the new finding. Cite evidence for each step and list the step threats' ids in "Related Threats". Report each chain once, as an emergent threat only.
+
+Do not report an emergent threat that restates a threat one subsystem already reported in full. When a pattern repeats across subsystems but no step leads into another subsystem, it is an aggregation.
 
 Respond with a JSON object:
 {
     "cross_cutting_threats": [
         {
+            "Classification": "aggregation" or "emergent",
             "Threat Type": "STRIDE category",
-            "Scenario": "Cross-cutting threat scenario spanning multiple subsystems",
+            "Scenario": "What is systemic (aggregation) or what emerges from the interaction (emergent)",
             "Potential Impact": "Systemic impact",
-            "Affected Subsystems": ["subsystem1", "subsystem2"]
+            "Affected Subsystems": ["subsystem1", "subsystem2"],
+            "Related Threats": ["ids of the subsystem threats summarised — required for an aggregation, optional for an emergent threat"],
+            "evidence": [{"path": "relative/path.py", "snippet": "code copied from the findings — required for an emergent threat, omit for an aggregation"}]
         }
     ]
 }"""
 
+AGGREGATION = "aggregation"
+EMERGENT = "emergent"
 
-def create_analysis_plan(models: ModelPair, target_path: Path) -> AnalysisPlan:
+
+def create_analysis_plan(
+    models: ModelPair, target_path: Path, *, usage: TokenUsage | None = None
+) -> AnalysisPlan:
     """Run Phase 1 only: scan the codebase and generate an analysis plan.
 
     This is separated from run_analysis() so callers can inspect/approve
     the plan before committing to the full analysis. Uses the architect
     tier — planning is reasoning-heavy.
+
+    ``usage``, if given, is filled in with this call's token usage. Pass it
+    to ``run_analysis`` as ``planning_usage`` so the run's totals include the
+    planning phase even though it ran outside ``run_analysis`` itself.
     """
-    return create_plan(models.for_architect(), target_path)
+    return create_plan(models.for_architect(), target_path, usage=usage)
+
+
+
+# Phases token usage is broken down by in the run manifest and console
+# summary. "planning" happens once, either inside run_analysis (when no plan
+# is supplied) or outside it via create_analysis_plan — see ``planning_usage``.
+TOKEN_PHASES = ("planning", "exploration", "compression", "synthesis", "dfd")
+
+
+def _sum_token_usage(phase_usage: dict[str, TokenUsage]) -> TokenUsage:
+    total = TokenUsage()
+    for usage in phase_usage.values():
+        total.merge(usage)
+    return total
 
 
 def run_analysis(
@@ -69,9 +126,10 @@ def run_analysis(
     plan: AnalysisPlan | None = None,
     max_llm_calls: int = 0,
     max_tool_calls: int = 0,
-    auto_approve: bool = False,
     progress: ProgressCallback | None = None,
-    console: Console | None = None,
+    resume_findings: dict[str, SubsystemFinding] | None = None,
+    on_checkpoint: Callable[[list[SubsystemFinding]], None] | None = None,
+    planning_usage: TokenUsage | None = None,
 ) -> AnalysisReport:
     """Run a full agentic threat model analysis on a codebase.
 
@@ -81,17 +139,38 @@ def run_analysis(
             cross-cutting synthesis, and context summarization.
         target_path: Path to the codebase root.
         plan: Pre-approved analysis plan. If None, creates one (Phase 1).
-        max_llm_calls: Hard limit on total LLM calls (0 = unlimited).
-        max_tool_calls: Hard limit on total tool executions (0 = unlimited).
-        auto_approve: Skip interactive plan approval (only used when plan is None).
+        max_llm_calls: Cap on LLM calls *per subsystem* (0 = unlimited).
+            Every subsystem gets the same budget and none is skipped for
+            spending it: one that reaches it gets one final round on top to
+            report what it found — see ``_grace_round`` — and is recorded
+            ``budget_exhausted``. ``llm_call_ceiling`` gives the bound this
+            puts on the whole run.
+        max_tool_calls: Cap on code exploration *per subsystem* (0 =
+            unlimited). Like ``max_llm_calls``, a subsystem that reaches it
+            reports what it found and is recorded ``budget_exhausted``; none
+            is skipped. Reporting a threat doesn't spend it: the cap bounds
+            reading the code, and a model mid-report must not be cut off.
+            ``metadata["tool_calls"]`` still counts every call the model made.
         progress: Progress callback for UI updates. Falls back to Rich console.
-        console: Deprecated — use progress instead. Kept for backward compat.
+        resume_findings: Subsystem name -> its checkpointed finding, from a
+            ``--resume`` run. A subsystem present here is reused verbatim
+            (no LLM call) instead of being analysed; every other subsystem
+            in the plan runs as normal.
+        on_checkpoint: Called with the findings list so far every time it
+            changes (a subsystem finished or was reused), so
+            the caller can persist a checkpoint. A resumed run's list also
+            holds the ``resume_findings`` not reached yet. Not called for
+            /quick-style callers that don't pass it.
+        planning_usage: Token usage already spent on planning, when ``plan``
+            was built externally via ``create_analysis_plan(usage=...)``.
+            Folded into the run's ``"planning"`` phase total so it isn't lost
+            just because planning happened outside this call.
 
     Returns:
         Complete AnalysisReport.
     """
     if progress is None:
-        progress = RichProgress(console or Console())
+        progress = RichProgress(Console())
 
     ctx = ContextManager(config=models.worker)
     llm_calls = 0
@@ -100,36 +179,18 @@ def run_analysis(
     # ``report.metadata["references_loaded"]`` so the run manifest can record
     # which cards actually shaped the output.
     loaded_refs: set[str] = set()
+    phase_usage: dict[str, TokenUsage] = {phase: TokenUsage() for phase in TOKEN_PHASES}
+    if planning_usage is not None:
+        phase_usage["planning"].merge(planning_usage)
 
     # --- Phase 1: Planning ---
     if plan is None:
         progress.phase_start("Phase 1", "Planning")
         progress.status("Scanning codebase and generating plan...")
-        plan = create_plan(models.for_architect(), target_path)
+        plan = create_plan(models.for_architect(), target_path, usage=phase_usage["planning"])
         llm_calls += 1
 
         progress.status(format_plan_for_display(plan))
-
-        if not auto_approve:  # noqa: SIM102 (trailing comment below belongs to this block)
-            # When no plan is provided and auto_approve is False,
-            # the caller should have handled approval. For backward compat
-            # with CLI, we use Rich console input if available.
-            if console is not None:
-                response = console.input("[bold yellow]Approve this plan? (y/n/q): [/bold yellow]")
-                if response.lower() not in ("y", "yes"):
-                    progress.complete("Analysis cancelled.")
-                    cancel_meta = _build_metadata(
-                        models, plan, llm_calls=llm_calls, tool_calls=tool_calls,
-                        subsystems_analyzed=0, status="cancelled",
-                    )
-                    cancel_meta["references_loaded"] = sorted(loaded_refs)
-                    return AnalysisReport(
-                        plan=plan,
-                        findings=[],
-                        metadata=cancel_meta,
-                    )
-            # If no console and not auto_approve, proceed anyway
-            # (caller should use the split API for interactive approval)
 
     # Report token budget so the user knows what context limit is in effect
     progress.token_budget(models.worker.model_name, ctx.context_window, source=ctx.budget_source.value)
@@ -145,24 +206,37 @@ def run_analysis(
     # --- Phase 2: Per-subsystem analysis ---
     progress.phase_start("Phase 2", "Analyzing Subsystems")
     findings: list[SubsystemFinding] = []
+    resumed_names: list[str] = []
+    rerun_names: list[str] = []
+    if on_checkpoint and resume_findings:
+        on_checkpoint = _keeping_unreached(on_checkpoint, resume_findings)
 
     for i, subsystem in enumerate(plan.subsystems, 1):
-        if max_llm_calls and llm_calls >= max_llm_calls - 1:
-            progress.limit_reached("LLM call", llm_calls, max_llm_calls)
-            break
-        if max_tool_calls and tool_calls >= max_tool_calls:
-            progress.limit_reached("tool call", tool_calls, max_tool_calls)
-            break
+        # A subsystem the checkpoint already completed costs nothing to
+        # reuse, so it bypasses the budget checks below entirely — a spent
+        # budget shouldn't stop a free reuse.
+        if resume_findings and subsystem.name in resume_findings:
+            finding = resume_findings[subsystem.name]
+            findings.append(finding)
+            resumed_names.append(subsystem.name)
+            progress.subsystem_start(i, len(plan.subsystems), subsystem.name, subsystem.description)
+            progress.status(f"Reusing checkpointed result for {subsystem.name}.")
+            progress.subsystem_done(subsystem.name, len(finding.threats), finding.outcome)
+            if on_checkpoint:
+                on_checkpoint(findings)
+            continue
 
         progress.subsystem_start(i, len(plan.subsystems), subsystem.name, subsystem.description)
+        rerun_names.append(subsystem.name)
 
-        # Pass remaining budget so a single subsystem can't starve later
-        # subsystems (or the synthesis pass). 0 still means unlimited.
-        remaining_llm = max_llm_calls - llm_calls if max_llm_calls else 0
-        remaining_tool = max_tool_calls - tool_calls if max_tool_calls else 0
+        # Both caps are per subsystem: every subsystem gets the same budget,
+        # and one that spends it reports through the grace round as
+        # ``budget_exhausted``. Run-level caps truncated the plan
+        # front-to-back instead, leaving later subsystems unanalysed.
+        sub_token_usage = TokenUsage()
 
         try:
-            sub_counts: dict[str, int] = {"llm": 0, "tool": 0}
+            sub_counts: dict[str, int] = {"llm": 0, "tool": 0, "explore": 0}
             finding = _analyze_subsystem(
                 models=models,
                 target_path=target_path,
@@ -170,93 +244,272 @@ def run_analysis(
                 subsystem_description=subsystem.description,
                 key_files=subsystem.key_files,
                 focus_areas=subsystem.focus_areas,
+                other_subsystems=[other for other in plan.subsystems if other is not subsystem],
                 ctx=ctx,
-                max_llm_calls=remaining_llm,
-                max_tool_calls=remaining_tool,
+                max_llm_calls=max_llm_calls,
+                max_tool_calls=max_tool_calls,
                 progress=progress,
                 call_counts=sub_counts,
                 loaded_refs=loaded_refs,
+                token_usage=sub_token_usage,
+                phase_usage=phase_usage,
             )
             llm_calls += sub_counts["llm"]
             tool_calls += sub_counts["tool"]
             findings.append(finding)
-            if sub_counts["tool"] == 0:
+            # Keyed on exploration, not total tool calls: a subsystem that
+            # only reported threats still never looked at the code.
+            if sub_counts.get("explore", 0) == 0:
                 progress.no_tool_use_warning(subsystem.name)
-            progress.subsystem_done(subsystem.name, len(finding.threats))
+            progress.subsystem_done(subsystem.name, len(finding.threats), finding.outcome)
+            if on_checkpoint:
+                on_checkpoint(findings)
         except Exception as e:
-            err_str = str(e)
-            if "n_keep" in err_str and "n_ctx" in err_str:
-                reason = "Context window exceeded — model ran out of space for this subsystem."
-            elif "crashed" in err_str.lower():
-                reason = "The model crashed, likely due to memory constraints."
-            else:
-                reason = f"Unexpected error: {err_str}"
+            partial = e.finding if isinstance(e, SubsystemAbortedError) else None
+            # The counts were recorded before the exception escaped.
+            llm_calls += sub_counts["llm"]
+            tool_calls += sub_counts["tool"]
+            error_class, reason = classify_error(
+                e.cause if isinstance(e, SubsystemAbortedError) else e
+            )
             progress.error(subsystem.name, reason)
+            note = f"Analysis stopped early — {reason}"
             findings.append(
                 SubsystemFinding(
                     subsystem=subsystem.name,
-                    threats=[],
-                    improvement_suggestions=[f"Analysis skipped — {reason}"],
+                    threats=partial.threats if partial else [],
+                    improvement_suggestions=[
+                        *(partial.improvement_suggestions if partial else []),
+                        note,
+                    ],
+                    files_analyzed=partial.files_analyzed if partial else [],
+                    outcome="error",
+                    error_class=error_class,
+                    token_usage=sub_token_usage,
                 )
             )
+            if on_checkpoint:
+                on_checkpoint(findings)
+
+    # Ids go on before synthesis so the architect can link to them. An id
+    # depends only on its own threat's text, so the pass below that adds the
+    # cross-cutting threats leaves these unchanged and the links still resolve.
+    assign_threat_ids(findings, [])
 
     # --- Phase 3: Synthesis ---
     cross_cutting: list[dict[str, Any]] = []
-    if len(findings) > 1 and (not max_llm_calls or llm_calls < max_llm_calls):
+    systemic: list[dict[str, Any]] = []
+    synthesis_error_class: str | None = None
+    synthesis_dropped: list[dict[str, str]] = []
+    if len(findings) > 1:
         progress.phase_start("Phase 3", "Synthesizing Cross-Cutting Threats")
         progress.status("Identifying cross-cutting threats...")
-        cross_cutting = _synthesize(models, findings)
-        llm_calls += 1
-        progress.synthesis_done(len(cross_cutting))
+        synth_counts = {"llm": 0}
+        synth_notes: dict[str, bool] = {}
+        try:
+            raw_synthesis = _synthesize(
+                models, findings, usage=phase_usage["synthesis"], call_counts=synth_counts,
+                notes=synth_notes,
+            )
+        except Exception as exc:
+            synthesis_error_class = type(exc).__name__
+            error_class, reason = classify_error(exc)
+            # A provider error or an unreadable reply explains itself. Anything
+            # else is likely a bug in synthesis, and its traceback is all there
+            # is to debug from.
+            logger.warning(
+                "Synthesis failed (%s)", synthesis_error_class,
+                exc_info=error_class == "unexpected" and not isinstance(exc, SynthesisParseError),
+            )
+            progress.synthesis_failed(reason)
+        else:
+            cross_cutting, systemic = classify_synthesis(
+                raw_synthesis, findings, target_path, dropped=synthesis_dropped,
+                evidence_stripped=synth_notes.get("evidence_stripped", False),
+            )
+            if systemic:
+                progress.status(f"Noted {len(systemic)} systemic observations (not counted as threats)")
+            progress.synthesis_done(len(cross_cutting))
+        finally:
+            llm_calls += synth_counts["llm"]
 
     # --- Phase 4: System-level DFD ---
     # Optional pass — gives the report a visual map of components and trust
     # boundaries. Wrapped in try/except so a bad DFD never nukes a good
-    # report. Skipped when no findings exist or the call budget is spent.
+    # report. Skipped when no findings exist.
     data_flow_diagram: str | None = None
-    if findings and (not max_llm_calls or llm_calls < max_llm_calls):
+    if findings:
         progress.status("Generating system-level Data Flow Diagram...")
         try:
-            data_flow_diagram = _generate_system_dfd(models, plan, findings)
+            data_flow_diagram = _generate_system_dfd(models, plan, findings, usage=phase_usage["dfd"])
             llm_calls += 1
         except Exception:
             data_flow_diagram = None
 
     metadata = _build_metadata(
         models, plan, llm_calls=llm_calls, tool_calls=tool_calls,
-        subsystems_analyzed=len(findings),
+        findings=findings, resumed_subsystems=resumed_names, rerun_subsystems=rerun_names,
     )
     metadata["references_loaded"] = sorted(loaded_refs)
+    metadata["token_usage"] = _token_usage_metadata(phase_usage)
+    if synthesis_error_class is not None:
+        metadata["synthesis_error_class"] = synthesis_error_class
+    metadata["synthesis_dropped"] = synthesis_dropped
 
+    assign_threat_ids(findings, cross_cutting)
     report = AnalysisReport(
         plan=plan,
         findings=findings,
         cross_cutting_threats=cross_cutting,
+        systemic_observations=systemic,
         data_flow_diagram=data_flow_diagram,
         metadata=metadata,
     )
 
-    total_threats = sum(len(f.threats) for f in findings) + len(cross_cutting)
-    succeeded = sum(1 for f in findings if f.threats)
-    failed = len(findings) - succeeded
-
-    if failed:
-        summary = (
-            f"Analysis partially complete — {failed}/{len(findings)} subsystems failed\n"
-            f"Subsystems analyzed: {succeeded}/{len(findings)}\n"
-            f"Total threats found: {total_threats}\n"
-            f"LLM calls: {llm_calls} | Tool calls: {tool_calls}"
-        )
-    else:
-        summary = (
-            f"Analysis complete!\n"
-            f"Subsystems analyzed: {succeeded}/{len(findings)}\n"
-            f"Total threats found: {total_threats}\n"
-            f"LLM calls: {llm_calls} | Tool calls: {tool_calls}"
-        )
-
-    progress.complete(summary)
+    total_usage = _sum_token_usage(phase_usage)
+    progress.complete(
+        _run_summary_text(findings, cross_cutting, llm_calls, tool_calls, total_usage)
+    )
     return report
+
+
+_THREAT_ID_LENGTH = 10
+# Cross-cutting threats belong to no subsystem. The NUL keeps this scope from
+# ever equalling a real subsystem name.
+_CROSS_CUTTING_SCOPE = "\x00cross-cutting"
+
+
+def make_threat_id(subsystem: str, threat_type: str, scenario: str) -> str:
+    """Content-derived threat id: a short hex hash of scope, type and scenario.
+
+    Depends on threat text only, never position or file paths, so it is stable
+    under reordering and safe to write into a redacted ``findings.json``.
+    """
+    normalised = " ".join(str(scenario).split())
+    payload = "\x00".join([str(subsystem), " ".join(str(threat_type).lower().split()), normalised])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:_THREAT_ID_LENGTH]
+
+
+def assign_threat_ids(
+    findings: list[SubsystemFinding], cross_cutting: list[dict[str, Any]]
+) -> None:
+    """Set a run-unique ``id`` on every threat in place.
+
+    Colliding ids get a ``-2``, ``-3``... suffix. Colliding threats are
+    ordered by their full content first so the suffixes do not depend on the
+    order the findings or threats arrived in.
+    """
+    by_base: dict[str, list[dict[str, Any]]] = {}
+    scoped = [(f.subsystem, f.threats) for f in findings]
+    scoped.append((_CROSS_CUTTING_SCOPE, cross_cutting))
+    for scope, threats in scoped:
+        for threat in threats:
+            base = make_threat_id(
+                scope, threat.get("Threat Type", ""), threat.get("Scenario", "")
+            )
+            by_base.setdefault(base, []).append(threat)
+
+    for base, threats in by_base.items():
+        threats.sort(
+            key=lambda t: json.dumps(
+                {k: v for k, v in t.items() if k != "id"}, sort_keys=True, default=str
+            )
+        )
+        for n, threat in enumerate(threats, start=1):
+            threat["id"] = base if n == 1 else f"{base}-{n}"
+
+
+def _token_usage_metadata(phase_usage: dict[str, TokenUsage]) -> dict[str, Any]:
+    """JSON-safe token usage summary for ``report.metadata``.
+
+    Plain dicts rather than ``TokenUsage`` instances — ``metadata`` ends up in
+    ``json.dumps`` calls (JSON/SARIF report rendering), which a bare pydantic
+    model would break.
+    """
+    total = _sum_token_usage(phase_usage)
+    return {
+        "available": total.available,
+        "total": total.model_dump(),
+        "by_phase": {name: usage.model_dump() for name, usage in phase_usage.items()},
+    }
+
+
+def _format_token_usage_line(usage: TokenUsage) -> str:
+    if not usage.available:
+        return "Token usage: unavailable"
+    prompt = usage.prompt_tokens or 0
+    completion = usage.completion_tokens or 0
+    return (
+        f"Token usage: {usage.total_tokens:,} "
+        f"(prompt: {prompt:,}{_format_cache_split(usage, prompt)} | completion: {completion:,})"
+    )
+
+
+def _format_cache_split(usage: TokenUsage, prompt: int) -> str:
+    """The cached/uncached breakdown of the prompt figure, or ``""`` when no
+    call reported one. Prompt tokens from calls that reported no split are
+    called out rather than silently folded into either side."""
+    if usage.cached_prompt_tokens is None and usage.uncached_prompt_tokens is None:
+        return ""
+    cached = usage.cached_prompt_tokens or 0
+    uncached = usage.uncached_prompt_tokens or 0
+    parts = [f"cached: {cached:,}", f"uncached: {uncached:,}"]
+    unreported = prompt - cached - uncached
+    if unreported > 0:
+        parts.append(f"cache unreported: {unreported:,}")
+    return f" [{', '.join(parts)}]"
+
+
+def _run_summary_text(
+    findings: list[SubsystemFinding],
+    cross_cutting: list[dict[str, Any]],
+    llm_calls: int,
+    tool_calls: int,
+    token_usage: TokenUsage,
+) -> str:
+    """The end-of-run console summary, counted by outcome.
+
+    It used to count a subsystem as succeeded only if it found threats, so a
+    clean subsystem with nothing to report was announced as a failure.
+    """
+    total_threats = sum(len(f.threats) for f in findings) + len(cross_cutting)
+    counts = count_outcomes(findings)
+    analysed = count_analysed(findings)
+
+    headline = (
+        "Analysis complete!" if analysed == len(findings) else "Analysis partially complete"
+    )
+    lines = [headline, f"Subsystems analyzed: {analysed}/{len(findings)}"]
+
+    unfinished = {o: n for o, n in counts.items() if o not in ANALYSED_OUTCOMES}
+    if unfinished:
+        lines.append(
+            "Not analyzed: "
+            + ", ".join(f"{n} {o.replace('_', ' ')}" for o, n in sorted(unfinished.items()))
+        )
+    lines.append(f"Total threats found: {total_threats}")
+    lines.append(f"LLM calls: {llm_calls} | Tool calls: {tool_calls}")
+    lines.append(_format_token_usage_line(token_usage))
+    return "\n".join(lines)
+
+
+def _keeping_unreached(
+    on_checkpoint: Callable[[list[SubsystemFinding]], None],
+    resume_findings: dict[str, SubsystemFinding],
+) -> Callable[[list[SubsystemFinding]], None]:
+    """Wrap ``on_checkpoint`` so a write keeps the resumed findings ahead of it.
+
+    Each write replaces the checkpoint, and the loop's list only holds what it
+    has reached. A run killed partway through a resume would otherwise lose
+    every completed finding later in the plan.
+    """
+
+    def write(findings: list[SubsystemFinding]) -> None:
+        reached = {f.subsystem for f in findings}
+        unreached = [f for name, f in resume_findings.items() if name not in reached]
+        on_checkpoint([*findings, *unreached])
+
+    return write
 
 
 def _build_metadata(
@@ -265,10 +518,17 @@ def _build_metadata(
     *,
     llm_calls: int,
     tool_calls: int,
-    subsystems_analyzed: int,
+    findings: list[SubsystemFinding],
     status: str | None = None,
+    resumed_subsystems: list[str] | None = None,
+    rerun_subsystems: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Build the metadata block stored on an AnalysisReport."""
+    """Build the metadata block stored on an AnalysisReport.
+
+    ``subsystems_analyzed`` counts the subsystems the model really analysed,
+    not the findings recorded: a crashed subsystem has a finding too.
+    """
+    counts = count_outcomes(findings)
     meta: dict[str, Any] = {
         "worker_model": models.worker.model_name,
         "worker_provider": models.worker.provider,
@@ -277,11 +537,348 @@ def _build_metadata(
         "app_type": plan.detected_app_type,
         "llm_calls": llm_calls,
         "tool_calls": tool_calls,
-        "subsystems_analyzed": subsystems_analyzed,
+        "subsystems_analyzed": count_analysed(findings),
+        "subsystem_outcomes": counts,
+        "resumed_subsystems": resumed_subsystems or [],
+        "rerun_subsystems": rerun_subsystems or [],
     }
     if status:
         meta["status"] = status
     return meta
+
+
+# A subsystem reports through tools, so it needs its own ceiling: the tool
+# budget deliberately doesn't gate reporting, and every turn still costs an
+# LLM call, but a model that loops on report_threat shouldn't run unbounded.
+MAX_THREATS_PER_SUBSYSTEM = 40
+
+GRACE_ROUND_PROMPT = (
+    "This is the final round for this subsystem — the call budget is exhausted "
+    "and no more exploration is possible. Report every remaining threat you are "
+    "confident about with report_threat, then call finish with your improvement "
+    "suggestions. Only those two tools are available."
+)
+
+NUDGE_PROMPT = (
+    "You replied with text but did not call a tool, and this subsystem is not "
+    "finished. If there is more to check, continue with the tools. Otherwise "
+    "report each threat you found with report_threat, then call finish with your "
+    "improvement suggestions. Threats written as prose or JSON are not recorded."
+)
+
+# Arguments that fill the three always-present threat fields; everything else
+# in THREAT_ARG_TO_FIELD is optional and copied across only when the model set
+# it, so a threat dict keeps the shape it had before evidence existed.
+_REQUIRED_THREAT_ARGS = ("threat_type", "scenario", "potential_impact")
+
+
+def _threat_arg(args: dict[str, Any], name: str) -> Any:
+    """Read one report_threat argument, forgiving the shapes models produce.
+
+    The tool takes snake_case names, but a model with the report's own field
+    names in context — from a reference card, or a previous release's prompt —
+    will sometimes send those instead. Accepting both costs a dict lookup and
+    saves a threat that is otherwise fully formed.
+    """
+    if name in args:
+        return args[name]
+    field = THREAT_ARG_TO_FIELD[name]
+    if field in args:
+        return args[field]
+    return args.get(name.replace("_", " ").title())
+
+
+class SubsystemAbortedError(Exception):
+    """A subsystem raised partway through, carrying what it had already found.
+
+    Threats used to exist only in the model's final answer, so a mid-analysis
+    failure had nothing to lose. They now accumulate turn by turn, and a rate
+    limit or a context overflow on turn 8 would otherwise discard six threats
+    the model had already filed — with their verified evidence.
+    """
+
+    def __init__(self, cause: BaseException, finding: SubsystemFinding) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.finding = finding
+
+
+class _SubsystemRun:
+    """State for one subsystem's conversation.
+
+    Threats arrive through ``report_threat`` as the model finds them rather
+    than as one JSON blob at the end, so the run has to accumulate them — and
+    the tool results it hands back are what tell the model what was recorded.
+    """
+
+    def __init__(
+        self,
+        *,
+        target_path: Path,
+        subsystem_name: str,
+        progress: ProgressCallback,
+        max_tool_calls: int,
+        loaded_refs: set[str] | None,
+        token_usage: TokenUsage | None = None,
+    ) -> None:
+        self.target_path = target_path
+        self.subsystem_name = subsystem_name
+        self.progress = progress
+        self.max_tool_calls = max_tool_calls
+        self.loaded_refs = loaded_refs
+        # This subsystem's own token spend (exploration + compression + the
+        # grace round). A fresh accumulator when the caller doesn't need to
+        # read it back directly (e.g. the standalone _analyze_subsystem tests).
+        self.token_usage = token_usage if token_usage is not None else TokenUsage()
+
+        self.threats: list[dict[str, Any]] = []
+        self.suggestions: list[str] = []
+        self.files_read: list[str] = []
+        self.llm_calls = 0
+        self.tool_calls = 0
+        self.explore_calls = 0
+        self.finished = False
+        self.reporting_only = False
+        # Why the subsystem stopped is derived from these two at the end
+        # rather than assigned from each of the loop's several exits.
+        self.grace_ran = False
+        self.lost_text = False
+        self._seen: set[tuple[str, str]] = set()
+        self._cache: dict[str, str] = {}
+
+    def clear_tool_cache(self) -> None:
+        """Forget cached tool results after compression replaced them."""
+        self._cache.clear()
+
+    # -- tool handling ----------------------------------------------------
+
+    def handle(self, tc: ToolCallResult) -> str:
+        """Run one tool call and return the result text.
+
+        Always returns a string: every tool call in a batch must get a
+        matching ``role: "tool"`` message, or the next request is one a strict
+        provider rejects. That matters now that the grace round replays the
+        real conversation instead of a stripped copy of it.
+        """
+        if tc.parse_error:
+            # Still a call the model spent a turn on, so it still costs budget.
+            self.tool_calls += 1
+            if tc.function_name not in REPORTING_TOOL_NAMES:
+                self.explore_calls += 1
+            return (
+                f"Error: {tc.parse_error}. Re-issue the call with a valid JSON object."
+            )
+        if tc.function_name == "finish":
+            return self._handle_finish(tc)
+        if tc.function_name == "report_threat":
+            return self._handle_report(tc)
+        if self.reporting_only:
+            return (
+                f"Error: {tc.function_name} is not available in the final round. "
+                "Use report_threat or finish."
+            )
+        return self._handle_exploration(tc)
+
+    def _handle_finish(self, tc: ToolCallResult) -> str:
+        if self.finished:
+            return "Error: finish has already been called for this subsystem."
+        self.finished = True
+        self.tool_calls += 1
+        raw = tc.arguments.get("improvement_suggestions") or []
+        if isinstance(raw, str):
+            raw = [raw]
+        if isinstance(raw, list):
+            self.suggestions.extend(
+                s.strip() for s in raw if isinstance(s, str) and s.strip()
+            )
+        self.progress.tool_call("finish", f"suggestions={len(self.suggestions)}", cached=False)
+        verified = sum(
+            1
+            for t in self.threats
+            if any(e.get("verified") for e in t.get("evidence", []))
+        )
+        return (
+            f"Subsystem analysis complete: {len(self.threats)} threats recorded "
+            f"({verified} with verified evidence), "
+            f"{len(self.suggestions)} improvement suggestions. "
+            "Stop now — do not call any more tools."
+        )
+
+    def _handle_report(self, tc: ToolCallResult) -> str:
+        message, checks = self._record_threat(tc.arguments)
+        if checks is None:
+            return message
+        self.tool_calls += 1
+
+        verified = sum(1 for c in checks if c.verified)
+        brief = f"type={self.threats[-1]['Threat Type']!r}"
+        if checks:
+            brief += f", evidence={verified}/{len(checks)} verified"
+        self.progress.tool_call("report_threat", brief, cached=False)
+        return message
+
+    def _record_threat(self, args: dict[str, Any]) -> tuple[str, list[EvidenceCheck] | None]:
+        """Validate, dedupe, cap and verify one threat, then record it.
+
+        Returns the message for the model and the evidence checks, or ``None``
+        in place of the checks when nothing was recorded. Shared with the
+        plain-text fallback, so a threat written as prose gets the same checks
+        as one reported through the tool.
+        """
+        scenario = str(_threat_arg(args, "scenario") or "").strip()
+        if not scenario:
+            return (
+                "Error: report_threat requires a non-empty 'scenario'. "
+                "Nothing was recorded."
+            ), None
+        if len(self.threats) >= MAX_THREATS_PER_SUBSYSTEM:
+            return (
+                f"Error: the per-subsystem limit of {MAX_THREATS_PER_SUBSYSTEM} threats "
+                "has been reached. Call finish now."
+            ), None
+
+        threat_type = str(_threat_arg(args, "threat_type") or "Unknown")
+        # Compression summarises away the model's own report_threat turns, so
+        # it can re-report a threat it already filed. Signature dedupe is
+        # cheaper and more reliable than trying to preserve those turns.
+        signature = (threat_type.lower(), " ".join(scenario.lower().split())[:200])
+        if signature in self._seen:
+            return (
+                "This threat is already recorded; no duplicate was added. "
+                "Report a different threat or call finish."
+            ), None
+        self._seen.add(signature)
+
+        threat: dict[str, Any] = {
+            "Threat Type": threat_type,
+            "Scenario": scenario,
+            "Potential Impact": str(_threat_arg(args, "potential_impact") or ""),
+        }
+        for arg, field in THREAT_ARG_TO_FIELD.items():
+            if arg in _REQUIRED_THREAT_ARGS:
+                continue
+            value = _threat_arg(args, arg)
+            if value not in (None, "", []):
+                threat[field] = value
+
+        checks = verify_evidence(self.target_path, args.get("evidence"))
+        # Omitted rather than empty, so a threat with no evidence is the same
+        # dict shape it was before this existed.
+        if checks:
+            threat["evidence"] = [c.to_dict() for c in checks]
+        self.threats.append(threat)
+        return (
+            f"Recorded threat #{len(self.threats)} ({threat_type}). "
+            + summarise_checks(checks)
+        ), checks
+
+    def _handle_exploration(self, tc: ToolCallResult) -> str:
+        if self.max_tool_calls and self.explore_calls >= self.max_tool_calls:
+            # Answered rather than skipped: a tool call with no result is a
+            # malformed conversation, and the grace round sends this history.
+            return (
+                "Error: the tool budget for this subsystem is exhausted; this call was "
+                "not executed. Report the threats you already have with report_threat, "
+                "then call finish."
+            )
+
+        key = tc.function_name + ":" + json.dumps(tc.arguments, sort_keys=True)
+        # A call with unparseable arguments isn't the same call as one with no
+        # arguments, so keep it out of the cache both ways.
+        cached = self._cache.get(key)
+        if cached is not None:
+            result = (
+                "You already have this result from a previous call. "
+                "Refer to the earlier tool response instead of requesting it again."
+            )
+            self.progress.tool_call(tc.function_name, _brief_args(tc.arguments), cached=True)
+        else:
+            result = execute_tool(self.target_path, tc, loaded_refs=self.loaded_refs)
+            self._cache[key] = result
+            self.progress.tool_call(tc.function_name, _brief_args(tc.arguments), cached=False)
+            # Only here: a repeat gets the reply above whether the first call
+            # worked or not, and a first call that worked is already recorded.
+            if tc.function_name == "read_file" and not result.startswith("Error"):
+                self._record_file(tc.arguments.get("path"))
+
+        self.tool_calls += 1
+        self.explore_calls += 1
+        return result
+
+    def _record_file(self, path: Any) -> None:
+        """Record a file the agent really opened.
+
+        ``files_analyzed`` used to be whatever the model claimed at the end.
+        Only successful ``read_file`` calls count: a grep hit shows one line,
+        not a file the agent studied.
+        """
+        clean = normalise_path(path)
+        if clean and clean not in self.files_read:
+            self.files_read.append(clean)
+
+    # -- results ----------------------------------------------------------
+
+    def take_text_fallback(self, content: str) -> bool:
+        """Absorb a final plain-text answer. Returns True if it carried JSON.
+
+        Deprecated transition path for models with weak tool calling: threats
+        written as JSON prose are still parsed for one release.
+        """
+        logger.warning(
+            "Subsystem %r answered with plain text instead of calling finish; "
+            "parsing JSON from the text (deprecated fallback).",
+            self.subsystem_name,
+        )
+        data = extract_json_object(content)
+        if data is None:
+            self.lost_text = True
+            return False
+        # Only when nothing came through the tools — a model that does both
+        # would otherwise have every threat counted twice. Each one goes
+        # through the same checks as report_threat, so a "verified" flag or a
+        # line number written in the prose is never taken on trust.
+        if not self.threats:
+            threats = data.get("threats")
+            if isinstance(threats, list):
+                for t in threats:
+                    if isinstance(t, dict):
+                        self._record_threat(t)
+        suggestions = data.get("improvement_suggestions")
+        if isinstance(suggestions, list):
+            self.suggestions.extend(str(s) for s in suggestions if s)
+        if not self.files_read:
+            claimed = data.get("files_analyzed")
+            if isinstance(claimed, list):
+                self.files_read.extend(normalise_path(f) for f in claimed if f)
+        return True
+
+    def outcome(self) -> SubsystemOutcome:
+        """Why this subsystem stopped.
+
+        Checked in this order because an unparseable text answer that left no
+        threats is the one case where the finding is empty and untrustworthy —
+        that matters more than which budget ran out first. A run that ran out
+        of budget says so even if its final round was text; otherwise a text
+        ending after recorded threats means the model stopped without
+        finishing.
+        """
+        if self.lost_text and not self.threats:
+            return "parse_failed"
+        if self.grace_ran:
+            return "budget_exhausted"
+        if self.lost_text:
+            return "unfinished"
+        return "completed"
+
+    def finding(self) -> SubsystemFinding:
+        return SubsystemFinding(
+            subsystem=self.subsystem_name,
+            threats=self.threats,
+            improvement_suggestions=self.suggestions,
+            files_analyzed=self.files_read,
+            outcome=self.outcome(),
+            token_usage=self.token_usage,
+        )
 
 
 def _analyze_subsystem(
@@ -297,171 +894,377 @@ def _analyze_subsystem(
     progress: ProgressCallback,
     call_counts: dict[str, int],
     loaded_refs: set[str] | None = None,
+    token_usage: TokenUsage | None = None,
+    phase_usage: dict[str, TokenUsage] | None = None,
+    other_subsystems: list[Subsystem] | None = None,
 ) -> SubsystemFinding:
-    """Analyze a single subsystem using the agent loop."""
+    """Analyze a single subsystem using the agent loop.
+
+    The model explores with the filesystem tools and reports each threat
+    through ``report_threat`` as it finds it, ending with ``finish``. When the
+    budget runs out it gets one final round offering only those two tools, on
+    the real conversation — no summarisation, no forced-JSON call on a lossy
+    copy of the history.
+    """
     user_prompt = f"""Analyze the "{subsystem_name}" subsystem for STRIDE threats.
 
 Description: {subsystem_description}
 Key files to examine: {', '.join(key_files) if key_files else 'Discover relevant files using search_files and list_directory'}
 Focus areas: {', '.join(focus_areas) if focus_areas else 'All STRIDE categories'}
 
-Start by reading the key files. Use grep to find security-relevant patterns like authentication, authorization, input validation, SQL queries, file operations, secret handling, encryption, and network calls."""
+Start by reading the key files. Use grep to find security-relevant patterns like authentication, authorization, input validation, SQL queries, file operations, secret handling, and network calls. Report each threat with report_threat as you find it, then call finish."""
+
+    if other_subsystems:
+        # Issue #264: without this, a worker that follows a call into another
+        # subsystem's file re-reports what that subsystem's worker will find.
+        others = "\n".join(
+            f"- {o.name}: {', '.join(o.key_files) if o.key_files else 'no key files listed'}"
+            for o in other_subsystems
+        )
+        user_prompt += f"""
+
+Other subsystems in this analysis, each analyzed separately:
+{others}
+
+The files listed above belong to those subsystems. You can read them to understand a threat here, but leave weaknesses in them to that subsystem's analysis. Report what you find in every other file you read, including files that no subsystem lists: the lists are a sample of each subsystem's code, not all of it. When this subsystem's code can reach a weakness in another subsystem, report the whole chain as one threat: cite this subsystem's code and the line it reaches there, and name that subsystem in the scenario. When another subsystem's code reaches a weakness here, the chain belongs to that subsystem: report the weakness here, cite only this subsystem's code, and name the other subsystem as a way in."""
 
     messages: list[dict] = [
         {"role": "system", "content": AGENT_SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
 
-    llm_calls = 0
-    tool_calls = 0
-    tool_cache: dict[str, str] = {}
+    run = _SubsystemRun(
+        target_path=target_path,
+        subsystem_name=subsystem_name,
+        progress=progress,
+        max_tool_calls=max_tool_calls,
+        loaded_refs=loaded_refs,
+        token_usage=token_usage,
+    )
+    nudged = False
 
-    while (not max_llm_calls or llm_calls < max_llm_calls) and \
-          (not max_tool_calls or tool_calls < max_tool_calls):
-        progress.status(f"Thinking about {subsystem_name}...")
-        response = call_llm_with_tools(models.worker, messages, AGENT_TOOLS)
-        llm_calls += 1
+    try:
+        while not run.finished and (not max_llm_calls or run.llm_calls < max_llm_calls):
+            progress.status(f"Thinking about {subsystem_name}...")
+            response = call_llm_with_tools(models.worker, messages, SUBSYSTEM_TOOLS)
+            run.llm_calls += 1
+            run.token_usage.record(response)
+            if phase_usage is not None:
+                phase_usage["exploration"].record(response)
 
-        if response.tool_calls:
-            # Execute tool calls
-            messages.append({"role": "assistant", "content": response.content or "",
-                           "tool_calls": [
-                               {"id": tc.id, "type": "function",
-                                "function": {"name": tc.function_name,
-                                             "arguments": json.dumps(tc.arguments)}}
-                               for tc in response.tool_calls
-                           ]})
+            if not response.tool_calls:
+                if nudged:
+                    # Two text replies in a row: this one is the final answer.
+                    run.take_text_fallback(response.content)
+                    return run.finding()
+                # One nudge per tool round, on the real conversation and with
+                # the model's own reply in it, so a model that narrates between
+                # tool calls isn't cut off and can see what it was told about.
+                nudged = True
+                if (response.content or "").strip():
+                    messages.append({"role": "assistant", "content": response.content})
+                messages = _append_user(messages, NUDGE_PROMPT)
+                continue
+            nudged = False
 
+            messages.append({
+                "role": "assistant",
+                "content": response.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function_name,
+                            "arguments": json.dumps(tc.arguments),
+                        },
+                    }
+                    for tc in response.tool_calls
+                ],
+            })
             for tc in response.tool_calls:
-                if max_tool_calls and tool_calls >= max_tool_calls:
-                    break
-                cache_key = tc.function_name + ":" + json.dumps(tc.arguments, sort_keys=True)
-                cached = tool_cache.get(cache_key)
-                if cached is not None:
-                    result = (
-                        "You already have this result from a previous call. "
-                        "Refer to the earlier tool response instead of requesting it again."
-                    )
-                    progress.tool_call(tc.function_name, _brief_args(tc.arguments), cached=True)
-                else:
-                    result = execute_tool(target_path, tc, loaded_refs=loaded_refs)
-                    tool_cache[cache_key] = result
-                    progress.tool_call(tc.function_name, _brief_args(tc.arguments), cached=False)
-                tool_calls += 1
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "name": tc.function_name,
-                    "content": result,
+                    "content": run.handle(tc),
                 })
 
-            # Check context and compress if needed
-            if ctx.needs_compression(messages):
-                messages = ctx.compress(models.for_architect(), messages)
-                llm_calls += 1  # Compression uses an LLM call
-        else:
-            # No tool calls — the model is done analyzing
-            call_counts["llm"] = llm_calls
-            call_counts["tool"] = tool_calls
-            finding = _parse_subsystem_finding(subsystem_name, response.content)
-            if finding is not None:
-                return finding
-            # JSON parse failed — retry with forced JSON output
-            return _retry_as_json(models, messages, subsystem_name, call_counts)
+            if run.finished:
+                break
+            if _explore_budget_spent(run, max_tool_calls):
+                break
+            # Compression counts against the cap, and only pays off if
+            # another exploration round follows; skipping it once the cap is
+            # reached keeps a subsystem within cap + 1 (the grace round).
+            if (not max_llm_calls or run.llm_calls < max_llm_calls) and ctx.needs_compression(messages):
+                compress_usage = TokenUsage()
+                compress_counts = {"llm": 0}
+                compressed = ctx.compress(
+                    models.for_architect(), messages,
+                    usage=compress_usage, call_counts=compress_counts,
+                )
+                if compressed is not messages:
+                    # The cache points the model at earlier tool responses,
+                    # which the summary has just replaced.
+                    run.clear_tool_cache()
+                    messages = compressed
+                # Only a summary that was asked for costs a call; nothing
+                # old enough to compress costs none.
+                run.llm_calls += compress_counts["llm"]
+                run.token_usage.merge(compress_usage)
+                if phase_usage is not None:
+                    phase_usage["compression"].merge(compress_usage)
 
-    # Hit limits — summarize findings and ask model to produce final analysis
-    clean_msgs = _prepare_for_plain_llm(models.for_architect(), messages)
-    llm_calls += 1  # summarization call
-    clean_msgs.append({
-        "role": "user",
-        "content": "You've reached the tool call limit. Please provide your STRIDE threat analysis now based on what you've gathered so far. Respond with the JSON format specified.",
-    })
-    json_config = models.worker.model_copy(update={"response_format": "json"})
-    response = call_llm(json_config, clean_msgs)
-    call_counts["llm"] = llm_calls + 1
-    call_counts["tool"] = tool_calls
-    finding = _parse_subsystem_finding(subsystem_name, response.content)
-    if finding is not None:
-        return finding
-    return SubsystemFinding(
-        subsystem=subsystem_name,
-        threats=[],
-        improvement_suggestions=["Failed to parse model response as JSON"],
-    )
-
-
-def _parse_subsystem_finding(subsystem_name: str, content: str) -> SubsystemFinding | None:
-    """Parse an LLM response into a SubsystemFinding.
-
-    Returns None if JSON cannot be extracted, signaling the caller to retry.
-    """
-    data = extract_json_object(content)
-    if data is None:
-        return None
-
-    return SubsystemFinding(
-        subsystem=subsystem_name,
-        threats=data.get("threats", []),
-        improvement_suggestions=data.get("improvement_suggestions", []),
-        files_analyzed=data.get("files_analyzed", []),
-    )
+        if not run.finished and run.llm_calls:
+            _grace_round(models, messages, run, progress, phase_usage=phase_usage)
+        return run.finding()
+    except Exception as e:
+        raise SubsystemAbortedError(e, run.finding()) from e
+    finally:
+        # One place, because the paths out of here multiplied: finish, a text
+        # answer, a nudged text answer, and two grace-round outcomes.
+        call_counts["llm"] = run.llm_calls
+        call_counts["tool"] = run.tool_calls
+        call_counts["explore"] = run.explore_calls
 
 
-def _retry_as_json(
+def _explore_budget_spent(run: _SubsystemRun, max_tool_calls: int) -> bool:
+    """Whether exploration is over, so the model should be asked to wrap up."""
+    return bool(max_tool_calls) and run.explore_calls >= max_tool_calls
+
+
+def _grace_round(
     models: ModelPair,
     messages: list[dict],
-    subsystem_name: str,
-    call_counts: dict[str, int],
-) -> SubsystemFinding:
-    """Retry the final analysis with forced JSON output.
+    run: _SubsystemRun,
+    progress: ProgressCallback,
+    *,
+    phase_usage: dict[str, TokenUsage] | None = None,
+) -> None:
+    """One last call on the real conversation, offering only the two reporting tools.
 
-    Summarization uses the architect (a reasoning task). The JSON-forced
-    final call uses the worker (it's the same task as the original
-    exploration's final-answer call, just with stricter formatting).
+    This replaces the old cap path, which summarised the conversation and then
+    forced JSON out of the summary — two calls, on a copy that had already
+    lost the detail the model was about to write up.
     """
-    clean_msgs = _prepare_for_plain_llm(models.for_architect(), messages)
-    call_counts["llm"] = call_counts.get("llm", 0) + 1  # summarization call
-    clean_msgs.append({
-        "role": "user",
-        "content": "Please respond with ONLY a valid JSON object in the format specified in your instructions. No other text.",
+    progress.status(f"Final round for {run.subsystem_name}...")
+    run.reporting_only = True
+    run.grace_ran = True
+    grace_msgs = _append_user(messages, GRACE_ROUND_PROMPT)
+    response = call_llm_with_tools(models.worker, grace_msgs, REPORTING_TOOLS)
+    run.llm_calls += 1
+    run.token_usage.record(response)
+    if phase_usage is not None:
+        phase_usage["exploration"].record(response)
+
+    if not response.tool_calls:
+        run.take_text_fallback(response.content)
+        return
+
+    grace_msgs.append({
+        "role": "assistant",
+        "content": response.content or "",
+        "tool_calls": [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {"name": tc.function_name, "arguments": json.dumps(tc.arguments)},
+            }
+            for tc in response.tool_calls
+        ],
     })
-    json_config = models.worker.model_copy(update={"response_format": "json"})
-    response = call_llm(json_config, clean_msgs)
-    call_counts["llm"] = call_counts.get("llm", 0) + 1
-
-    finding = _parse_subsystem_finding(subsystem_name, response.content)
-    if finding is not None:
-        return finding
-    return SubsystemFinding(
-        subsystem=subsystem_name,
-        threats=[],
-        improvement_suggestions=["Failed to parse model response as JSON after retry"],
-    )
+    for tc in response.tool_calls:
+        grace_msgs.append({
+            "role": "tool",
+            "tool_call_id": tc.id,
+            "name": tc.function_name,
+            "content": run.handle(tc),
+        })
 
 
-def _synthesize(models: ModelPair, findings: list[SubsystemFinding]) -> list[dict[str, Any]]:
-    """Identify cross-cutting threats across all subsystem findings.
+def _threats_without_evidence(threats: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop evidence snippets before sending threats to another model.
 
-    Uses the architect tier — synthesis is a cross-cutting reasoning task.
+    Synthesis sends them in full so the architect can cite what it is
+    generalising; this is the last resort when even that would overflow the
+    architect's context window, since snippets are the largest thing in the
+    payload.
     """
-    findings_summary = json.dumps(
+    return [{k: v for k, v in t.items() if k != "evidence"} for t in threats]
+
+
+def _known_links(related: Any, known_ids: set[str]) -> list[str]:
+    """The ids in ``related`` that name a real threat, deduplicated, order kept.
+
+    ``related`` is whatever the architect emitted: the list of id strings the
+    prompt asks for, a single bare string, or — it is model output — anything
+    at all. A non-string entry is dropped rather than tested against
+    ``known_ids``, because an unhashable one raises out of the ``in`` test;
+    ``[{"id": "auth-T1"}]`` is the shape a model reaches for when told to list
+    ids, and it used to take the whole run down at the end of phase 3.
+    """
+    if isinstance(related, str):
+        related = [related]
+    if not isinstance(related, list):
+        return []
+    return list(dict.fromkeys(r for r in related if isinstance(r, str) and r in known_ids))
+
+
+def classify_synthesis(
+    raw: list[dict[str, Any]],
+    findings: list[SubsystemFinding],
+    target_path: Path,
+    *,
+    evidence_stripped: bool = False,
+    dropped: list[dict[str, str]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split synthesis output into ``(emergent threats, aggregations)``.
+
+    The architect classifies each item, but the classification is only
+    honoured when the item backs it up:
+
+    * an aggregation must link to at least one threat that exists, and
+      carries no evidence of its own;
+    * an emergent threat must cite evidence, which is checked against the code
+      by ``verify_evidence`` exactly as a subsystem threat's is, and at least
+      one of its snippets must verify. When one does, it is kept and any
+      unverified snippets stay on it marked ``verified: false``; when none
+      does, it is dropped.
+
+    Anything else is dropped and logged. An aggregation linking to nothing is
+    a claim with no support, and an emergent threat citing nothing is the
+    unverifiable restatement this split exists to stop counting as a threat.
+
+    The verified-snippet rule is stricter than a subsystem threat gets. The
+    architect has no tools: the only code it sees is the evidence quoted in
+    the findings, so a citation that fails to verify was altered from one of
+    those snippets or invented, and unlike a worker it gets no feedback and no
+    chance to correct it. ``evidence_stripped`` says the findings were sent
+    without their snippets to fit the architect's context window, which
+    leaves it nothing to cite; every emergent threat is then expected to be
+    dropped, and the log says why.
+
+    When ``dropped`` is given, each dropped item is appended to it as
+    ``{"item": <Threat Type>, "reason": <why>}`` so the run manifest and the
+    report can tell "every item was dropped" apart from "synthesis found
+    nothing".
+    """
+    known_ids = {t["id"] for f in findings for t in f.threats if isinstance(t.get("id"), str)}
+    emergent: list[dict[str, Any]] = []
+    aggregations: list[dict[str, Any]] = []
+
+    def drop(item: str, reason: str) -> None:
+        logger.warning("Dropped %s: %s", item, reason)
+        if dropped is not None:
+            dropped.append({"item": item, "reason": reason})
+
+    if not isinstance(raw, list):
+        # `_synthesize` hands back whatever sat under "cross_cutting_threats",
+        # which a model can make a string or a number. Phase 3 is the last
+        # thing before the report, so iterating that would throw away every
+        # subsystem finding the run just paid for.
+        drop("synthesis output", f"expected a list of items, got {type(raw).__name__}")
+        return emergent, aggregations
+
+    for item in raw:
+        if not isinstance(item, dict):
+            drop("synthesis item", f"expected an object, got {type(item).__name__}")
+            continue
+        kind = str(item.get("Classification") or "").strip().lower()
+        label = f"{item.get('Threat Type', 'Unknown')!r}"
+        entry = {k: v for k, v in item.items() if k != "evidence"}
+        entry["Classification"] = kind
+
+        if kind == AGGREGATION:
+            linked = _known_links(item.get("Related Threats"), known_ids)
+            if not linked:
+                drop(f"aggregation {label}", "it links to no known threat id")
+                continue
+            entry["Related Threats"] = linked
+            aggregations.append(entry)
+        elif kind == EMERGENT:
+            checks = verify_evidence(target_path, item.get("evidence"))
+            if not checks:
+                drop(f"emergent threat {label}", "it cites no evidence")
+                continue
+            if not any(c.verified for c in checks):
+                drop(
+                    f"emergent threat {label}",
+                    "none of its evidence verifies"
+                    + (" (evidence stripped to fit context)" if evidence_stripped else ""),
+                )
+                continue
+            entry["evidence"] = [c.to_dict() for c in checks]
+            # Optional here, so an emergent threat that links to nothing real
+            # loses the key rather than the threat. Same reader as the
+            # aggregation branch: a lone id arrives as a bare string often
+            # enough that dropping it would silently lose a valid link.
+            linked = _known_links(entry.get("Related Threats"), known_ids)
+            if linked:
+                entry["Related Threats"] = linked
+            else:
+                entry.pop("Related Threats", None)
+            emergent.append(entry)
+        else:
+            drop(
+                f"synthesis item {label}",
+                f"classification {item.get('Classification')!r} is neither "
+                f"{AGGREGATION!r} nor {EMERGENT!r}",
+            )
+    return emergent, aggregations
+
+
+def _findings_summary(
+    findings: list[SubsystemFinding], *, max_files: int | None = None, evidence: bool = True
+) -> str:
+    """The per-subsystem findings as the JSON the architect reads."""
+    return json.dumps(
         [
             {
                 "subsystem": f.subsystem,
-                "threats": f.threats,
-                "files_analyzed": f.files_analyzed,
+                "threats": f.threats if evidence else _threats_without_evidence(f.threats),
+                "files_analyzed": f.files_analyzed[:max_files],
             }
             for f in findings
         ],
         indent=2,
     )
 
+
+class SynthesisParseError(ValueError):
+    """The architect's synthesis reply was not JSON, even after a retry."""
+
+
+def _synthesize(
+    models: ModelPair,
+    findings: list[SubsystemFinding],
+    *,
+    usage: TokenUsage | None = None,
+    call_counts: dict[str, int] | None = None,
+    notes: dict[str, bool] | None = None,
+) -> list[dict[str, Any]]:
+    """Ask the architect for cross-cutting output across all subsystem findings.
+
+    Returns the raw items, each classified as an aggregation or an emergent
+    threat; ``classify_synthesis`` validates them and splits the two kinds.
+    Uses the architect tier — synthesis is a cross-cutting reasoning task.
+    ``call_counts["llm"]`` is set to the calls made: one, or two when the
+    first reply was not JSON. ``notes["evidence_stripped"]`` is set when the
+    findings had to be sent without their evidence snippets.
+    """
+    findings_summary = _findings_summary(findings)
+
     architect = models.for_architect()
 
     # Guard against the architect having a smaller context window than the
     # raw findings summary — trim per-finding if so. Worker's window drives
     # the agent loop, but the architect handles the synthesis call.
-    findings_summary = _truncate_findings_to_fit(architect, findings, findings_summary)
+    findings_summary, evidence_shown = _truncate_findings_to_fit(
+        architect, findings, findings_summary
+    )
+    if notes is not None:
+        notes["evidence_stripped"] = not evidence_shown
 
     json_config = architect.model_copy(update={"response_format": "json"})
     messages: list[dict] = [
@@ -469,6 +1272,10 @@ def _synthesize(models: ModelPair, findings: list[SubsystemFinding]) -> list[dic
         {"role": "user", "content": f"Per-subsystem findings:\n{findings_summary}"},
     ]
     response = call_llm(json_config, messages)
+    if call_counts is not None:
+        call_counts["llm"] = 1
+    if usage is not None:
+        usage.record(response)
     data = extract_json_object(response.content)
 
     # Still failed — retry with explicit instruction
@@ -479,15 +1286,27 @@ def _synthesize(models: ModelPair, findings: list[SubsystemFinding]) -> list[dic
             "content": "Please respond with ONLY a valid JSON object in the format specified. No other text.",
         })
         response = call_llm(json_config, messages)
+        if call_counts is not None:
+            call_counts["llm"] = 2
+        if usage is not None:
+            usage.record(response)
         data = extract_json_object(response.content)
 
     if data is None:
-        return []
+        # Raised rather than returning [], which looked identical to a
+        # synthesis that found nothing cross-cutting.
+        raise SynthesisParseError(
+            "The architect's synthesis reply was not valid JSON, even after a retry."
+        )
     return data.get("cross_cutting_threats", [])
 
 
 def _generate_system_dfd(
-    models: ModelPair, plan: AnalysisPlan, findings: list[SubsystemFinding]
+    models: ModelPair,
+    plan: AnalysisPlan,
+    findings: list[SubsystemFinding],
+    *,
+    usage: TokenUsage | None = None,
 ) -> str | None:
     """Produce a system-level DFD in Mermaid form, or None on any failure.
 
@@ -524,7 +1343,9 @@ def _generate_system_dfd(
         app_input="\n".join(description_parts),
     )
 
-    mermaid, _ = generate_dfd(models.for_architect(), prompt)
+    mermaid, response = generate_dfd(models.for_architect(), prompt)
+    if usage is not None:
+        usage.record(response)
     return mermaid or None
 
 
@@ -532,143 +1353,44 @@ def _truncate_findings_to_fit(
     architect: LLMConfig,
     findings: list[SubsystemFinding],
     rendered: str,
-) -> str:
+) -> tuple[str, bool]:
     """If the rendered findings JSON exceeds the architect's context window,
-    trim per-finding `files_analyzed` lists (cheapest content) until it fits.
-    Falls through unchanged on any sizing error — better to send too much
-    and let the provider error than crash mid-synthesis here.
+    trim it until it fits: first the per-finding `files_analyzed` lists
+    (cheapest content), then the evidence snippets, which costs the architect
+    the ability to cite them. Falls through unchanged on any sizing error —
+    better to send too much and let the provider error than crash
+    mid-synthesis here.
+
+    Returns the text to send and whether it still carries the evidence.
     """
     try:
         ctx = ContextManager(config=architect)
         budget = int(ctx.context_window * COMPRESSION_BUDGET)
-        messages = [{"role": "user", "content": rendered}]
-        if ctx.count_tokens(messages) <= budget:
-            return rendered
 
-        return json.dumps(
-            [
-                {
-                    "subsystem": f.subsystem,
-                    "threats": f.threats,
-                    "files_analyzed": f.files_analyzed[:5],
-                }
-                for f in findings
-            ],
-            indent=2,
-        )
+        def fits(text: str) -> bool:
+            messages = [{"role": "user", "content": text}]
+            return ctx.count_tokens(messages) <= budget
+
+        if fits(rendered):
+            return rendered, True
+        trimmed = _findings_summary(findings, max_files=5)
+        if fits(trimmed):
+            return trimmed, True
+        logger.warning("Synthesis findings sent without evidence snippets to fit the architect's context")
+        return _findings_summary(findings, max_files=5, evidence=False), False
     except Exception:
-        return rendered
+        return rendered, True
 
 
 COMPRESSION_BUDGET = 0.75  # leave headroom for the system prompt + response
 
 
-SUMMARIZE_TRUNCATION = 6_000  # chars per message when building summary input
-
-SUMMARIZE_PROMPT = """You are summarizing the results of a security-focused codebase exploration.
-
-The following is a conversation between a security analyst and their tools. The analyst read files, searched for patterns, and listed directories. Summarize the key findings into a concise briefing that preserves:
-
-- Specific code patterns found (e.g., auth checks, input validation, secret handling)
-- File contents and architectural details relevant to STRIDE threat analysis
-- Any security weaknesses or concerns already noted
-- Enough concrete detail to support writing specific threat scenarios
-
-Be thorough — the analyst needs this summary to produce a final STRIDE threat report without access to the original files."""
-
-
-def _summarize_for_analysis(config: LLMConfig, messages: list[dict]) -> str:
-    """Summarize tool exploration results into a security-focused findings briefing."""
-    parts: list[str] = []
-    for msg in messages:
-        role = msg.get("role", "unknown")
-        content = str(msg.get("content", ""))
-        if not content.strip():
-            continue
-        # Tool call metadata: show what was called
-        if "tool_calls" in msg:
-            tcs = msg.get("tool_calls", [])
-            calls = ", ".join(
-                f"{tc.get('function', {}).get('name', '?')}({tc.get('function', {}).get('arguments', '')})"
-                for tc in tcs
-            )
-            parts.append(f"[assistant] Called: {calls}")
-            continue
-        # Truncate long content (file reads can be huge)
-        if len(content) > SUMMARIZE_TRUNCATION:
-            content = content[:SUMMARIZE_TRUNCATION] + "\n... (truncated)"
-        parts.append(f"[{role}] {content}")
-
-    conversation = "\n---\n".join(parts)
-
-    summary_messages = [
-        {"role": "system", "content": SUMMARIZE_PROMPT},
-        {"role": "user", "content": conversation},
-    ]
-    response = call_llm(config, summary_messages)
-    return response.content
-
-
-def _prepare_for_plain_llm(config: LLMConfig, messages: list[dict]) -> list[dict]:
-    """Prepare messages for a plain (non-tool-use) LLM call.
-
-    Summarizes tool exploration via an LLM call, then builds a clean message
-    list with no tool artifacts. Falls back to _strip_tool_calls if the
-    summarization call fails.
-    """
-    # Extract system messages and original user prompt
-    system_msgs = []
-    user_prompt_msg = None
-    for msg in messages:
-        if msg.get("role") == "system" and user_prompt_msg is None:
-            system_msgs.append(msg)
-        elif msg.get("role") == "user" and user_prompt_msg is None:
-            user_prompt_msg = msg
-            break
-
-    # Check if there are any tool results worth summarizing
-    has_tool_results = any(msg.get("role") == "tool" for msg in messages)
-    if not has_tool_results:
-        return _strip_tool_artifacts(messages)
-
-    try:
-        summary = _summarize_for_analysis(config, messages)
-    except Exception:
-        # Summarization failed — fall back to lossy stripping
-        return _strip_tool_artifacts(messages)
-
-    result = list(system_msgs)
-    if user_prompt_msg:
-        result.append(user_prompt_msg)
-    result.append({
-        "role": "user",
-        "content": f"[Findings from codebase exploration]\n{summary}",
-    })
-
-    # Preserve any substantive assistant analysis text
-    assistant_parts = []
-    for msg in messages:
-        if msg.get("role") == "assistant":
-            text = (msg.get("content") or "").strip()
-            if text and "tool_calls" not in msg:
-                assistant_parts.append(text)
-    if assistant_parts:
-        result.append({"role": "assistant", "content": "\n\n".join(assistant_parts)})
-
-    return result
-
-
-def _strip_tool_artifacts(messages: list[dict]) -> list[dict]:
-    """Remove tool-call metadata from messages so they're valid for plain LLM calls."""
-    cleaned: list[dict] = []
-    for msg in messages:
-        if msg.get("role") == "tool":
-            continue
-        if "tool_calls" in msg:
-            cleaned.append({"role": msg["role"], "content": msg.get("content", "")})
-        else:
-            cleaned.append(msg)
-    return cleaned
+def _append_user(messages: list[dict], text: str) -> list[dict]:
+    """Add a user instruction, joining it to a trailing user message if there is one."""
+    last = messages[-1] if messages else None
+    if last is not None and last.get("role") == "user" and isinstance(last.get("content"), str):
+        return [*messages[:-1], {**last, "content": f"{last['content']}\n\n{text}"}]
+    return [*messages, {"role": "user", "content": text}]
 
 
 def _brief_args(args: dict) -> str:

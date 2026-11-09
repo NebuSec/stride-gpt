@@ -10,32 +10,6 @@ from stride_gpt.core.prompts import create_image_analysis_prompt, create_reasoni
 from stride_gpt.core.schemas import LLMConfig, LLMResponse, ThreatModelOutput
 from stride_gpt.models import model_uses_completion_tokens
 
-THREAT_MODEL_SCHEMA: dict = {
-    "type": "object",
-    "properties": {
-        "threat_model": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "Threat Type": {"type": "string"},
-                    "Scenario": {"type": "string"},
-                    "Potential Impact": {"type": "string"},
-                    "OWASP_LLM": {"type": ["string", "null"]},
-                    "OWASP_ASI": {"type": ["string", "null"]},
-                    "INSIDER_CATEGORY": {"type": ["string", "null"]},
-                },
-                "required": ["Threat Type", "Scenario", "Potential Impact"],
-            },
-        },
-        "improvement_suggestions": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-    },
-    "required": ["threat_model", "improvement_suggestions"],
-}
-
 
 def generate_threat_model(config: LLMConfig, prompt: str) -> tuple[ThreatModelOutput, LLMResponse]:
     """Generate a threat model using any supported LLM provider."""
@@ -44,14 +18,7 @@ def generate_threat_model(config: LLMConfig, prompt: str) -> tuple[ThreatModelOu
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
     ]
-    # LM Studio doesn't support json_object mode — without an explicit schema it
-    # gets no structured-output enforcement at all and frequently emits prose
-    # that fails JSON parsing. Hand it the schema; other providers keep the
-    # existing json_object path to avoid regressions in callers that depend on it.
-    if config.provider == "LM Studio Server":
-        json_config = config.model_copy(update={"response_format": THREAT_MODEL_SCHEMA})
-    else:
-        json_config = config.model_copy(update={"response_format": "json"})
+    json_config = config.model_copy(update={"response_format": "json"})
     response = call_llm(json_config, messages)
     parsed = _parse_threat_model_response(response.content)
     return parsed, response
@@ -81,12 +48,12 @@ def json_to_markdown(threat_model, improvement_suggestions):
         threat_table_row,
     )
 
-    show_llm, show_asi, show_insider, show_mitre = detect_extra_columns(threat_model)
-    header, separator = threat_table_header(show_llm, show_asi, show_insider, show_mitre)
+    cols = detect_extra_columns(threat_model)
+    header, separator = threat_table_header(*cols)
 
     lines = ["## Threat Model", "", header, separator]
     lines.extend(
-        threat_table_row(threat, show_llm, show_asi, show_insider, show_mitre)
+        threat_table_row(threat, *cols)
         for threat in threat_model
     )
 

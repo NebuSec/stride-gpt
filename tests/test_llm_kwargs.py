@@ -1,9 +1,10 @@
-"""Regression tests for OpenAI SDK client / call kwargs."""
+"""Tests for the kwargs stride_gpt.core.llm hands to the OpenAI SDK."""
 
 from __future__ import annotations
 
+import pytest
+
 from stride_gpt.core.llm import (
-    _chat_call_kwargs,
     _client_kwargs,
     _responses_call_kwargs,
     _to_responses_tools,
@@ -13,96 +14,36 @@ from stride_gpt.core.schemas import LLMConfig
 
 
 class TestClientKwargs:
-    def test_lm_studio_placeholder_api_key_and_v1_base(self):
-        """LM Studio: OpenAI SDK refuses to build a client without an api_key
-        even for localhost. A missing key must become a placeholder
-        (issue #159), and /v1 is appended to the user-supplied host."""
-        cfg = LLMConfig(
-            provider="LM Studio Server",
-            model_name="google/gemma-4-e4b",
-            api_key="",
-            api_base="http://localhost:1234",
-        )
+    def test_openai_uses_the_default_host(self):
+        cfg = LLMConfig(provider="OpenAI API", model_name="gpt-6-sol", api_key="fake")
         kwargs = _client_kwargs(cfg)
-        assert kwargs["api_key"] == "not-needed"
-        assert kwargs["base_url"] == "http://localhost:1234/v1"
-
-    def test_lm_studio_real_key_preserved(self):
-        cfg = LLMConfig(
-            provider="LM Studio Server",
-            model_name="google/gemma-4-e4b",
-            api_key="sk-user-supplied",
-            api_base="http://localhost:1234",
-        )
-        kwargs = _client_kwargs(cfg)
-        assert kwargs["api_key"] == "sk-user-supplied"
-
-    def test_cloud_provider_without_key_still_passes_none(self):
-        """Placeholder is scoped to non-authenticating providers."""
-        cfg = LLMConfig(provider="OpenAI API", model_name="gpt-5.5", api_key="")
-        kwargs = _client_kwargs(cfg)
-        assert kwargs["api_key"] is None
+        assert kwargs["api_key"] == "fake"
+        assert kwargs["max_retries"] == 3
         assert "base_url" not in kwargs
 
-    def test_deepseek_uses_hosted_base_url(self):
+    def test_custom_base_url_is_passed_through(self):
         cfg = LLMConfig(
-            provider="DeepSeek API",
-            model_name="deepseek-v4-pro",
+            provider="OpenAI API",
+            model_name="gpt-6-sol",
             api_key="fake",
+            api_base="https://gateway.example/v1/",
         )
-        kwargs = _client_kwargs(cfg)
-        assert kwargs["base_url"] == "https://api.deepseek.com"
+        assert _client_kwargs(cfg)["base_url"] == "https://gateway.example/v1"
 
-    def test_groq_uses_hosted_base_url(self):
-        cfg = LLMConfig(
-            provider="Groq API",
-            model_name="llama-3.3-70b-versatile",
-            api_key="fake",
-        )
-        kwargs = _client_kwargs(cfg)
-        assert kwargs["base_url"] == "https://api.groq.com/openai/v1"
-
-
-class TestChatCallKwargs:
-    def test_deepseek_leaves_max_tokens_to_provider(self):
-        cfg = LLMConfig(
-            provider="DeepSeek API",
-            model_name="deepseek-v4-flash",
-            api_key="fake",
-        )
-        kwargs = _chat_call_kwargs(cfg, [{"role": "user", "content": "hi"}])
-        assert kwargs["model"] == "deepseek-v4-flash"
-        assert "max_tokens" not in kwargs
-        assert "max_completion_tokens" not in kwargs
-
-    def test_lm_studio_omits_json_object(self):
-        cfg = LLMConfig(
-            provider="LM Studio Server",
-            model_name="local-model",
-            api_key="not-needed",
-            api_base="http://localhost:1234",
-            response_format="json",
-        )
-        kwargs = _chat_call_kwargs(cfg, [{"role": "user", "content": "hi"}])
-        assert "response_format" not in kwargs
-
-    def test_json_object_sent_for_compatible_cloud(self):
-        cfg = LLMConfig(
-            provider="Mistral API",
-            model_name="mistral-small-2603",
-            api_key="fake",
-            response_format="json",
-        )
-        kwargs = _chat_call_kwargs(cfg, [{"role": "user", "content": "hi"}])
-        assert kwargs["response_format"] == {"type": "json_object"}
+    @pytest.mark.parametrize("provider", ["Groq API", "LM Studio Server", "Anthropic API"])
+    def test_a_dropped_provider_from_a_saved_config_is_refused(self, provider):
+        """It must not reach OpenAI's host with that provider's key and model."""
+        cfg = LLMConfig(provider=provider, model_name="m", api_key="fake")
+        with pytest.raises(ValueError, match="/config"):
+            _client_kwargs(cfg)
 
 
 class TestResponsesCallKwargs:
     def test_store_disabled_and_max_output_tokens(self):
-        cfg = LLMConfig(provider="OpenAI API", model_name="gpt-5.5", api_key="fake")
+        cfg = LLMConfig(provider="OpenAI API", model_name="gpt-6-sol", api_key="fake")
         kwargs = _responses_call_kwargs(cfg, [{"role": "user", "content": "hi"}])
         assert kwargs["store"] is False
-        assert kwargs["model"] == "gpt-5.5"
+        assert kwargs["model"] == "gpt-6-sol"
         assert kwargs["max_output_tokens"] == 128000
         assert "max_tokens" not in kwargs
         assert "max_completion_tokens" not in kwargs
@@ -110,7 +51,7 @@ class TestResponsesCallKwargs:
     def test_json_mode_uses_text_format(self):
         cfg = LLMConfig(
             provider="OpenAI API",
-            model_name="gpt-5.5",
+            model_name="gpt-6-sol",
             api_key="fake",
             response_format="json",
         )
@@ -120,7 +61,7 @@ class TestResponsesCallKwargs:
     def test_tools_skip_json_format(self):
         cfg = LLMConfig(
             provider="OpenAI API",
-            model_name="gpt-5.5",
+            model_name="gpt-6-sol",
             api_key="fake",
             response_format="json",
         )

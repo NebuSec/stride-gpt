@@ -9,6 +9,7 @@ import queue
 from typing import Any, Protocol, runtime_checkable
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 
 
@@ -25,8 +26,14 @@ class ProgressCallback(Protocol):
     def subsystem_start(self, index: int, total: int, name: str, description: str) -> None:
         """Starting analysis of a subsystem."""
 
-    def subsystem_done(self, name: str, threat_count: int) -> None:
-        """Finished analyzing a subsystem."""
+    def subsystem_done(self, name: str, threat_count: int, outcome: str) -> None:
+        """Finished analyzing a subsystem.
+
+        ``outcome`` is a ``SubsystemOutcome`` — "completed" when the model
+        finished on its own terms, "budget_exhausted" when it took the final
+        round, "parse_failed" when its answer was unusable, "unfinished" when
+        it stopped without calling finish.
+        """
 
     def tool_call(self, name: str, args_brief: str, cached: bool) -> None:
         """A tool was called during exploration."""
@@ -34,11 +41,11 @@ class ProgressCallback(Protocol):
     def error(self, name: str, reason: str) -> None:
         """An error occurred analyzing a subsystem."""
 
-    def limit_reached(self, kind: str, current: int, maximum: int) -> None:
-        """A hard limit (LLM calls or tool calls) was reached."""
-
     def synthesis_done(self, count: int) -> None:
         """Cross-cutting threat synthesis completed."""
+
+    def synthesis_failed(self, reason: str) -> None:
+        """Cross-cutting threat synthesis failed. Subsystem findings are kept."""
 
     def token_budget(self, model: str, limit: int, source: str) -> None:
         """Report the context token budget for the model.
@@ -65,26 +72,38 @@ class RichProgress:
         self.console.print(Panel(f"[bold]{phase}: {description}[/bold]", style="blue"))
 
     def status(self, message: str) -> None:
-        self.console.print(f"  [dim]{message}[/dim]")
+        self.console.print(f"  [dim]{escape(message)}[/dim]")
 
     def subsystem_start(self, index: int, total: int, name: str, description: str) -> None:
-        self.console.print(f"\n[bold cyan]({index}/{total}) Analyzing: {name}[/bold cyan]")
-        self.console.print(f"  {description}")
+        self.console.print(f"\n[bold cyan]({index}/{total}) Analyzing: {escape(name)}[/bold cyan]")
+        self.console.print(f"  {escape(description)}")
 
-    def subsystem_done(self, name: str, threat_count: int) -> None:
-        self.console.print(f"  [green]Found {threat_count} threats in {name}[/green]")
+    def subsystem_done(self, name: str, threat_count: int, outcome: str) -> None:
+        name = escape(name)
+        if outcome == "completed":
+            self.console.print(f"  [green]Found {threat_count} threats in {name}[/green]")
+        elif outcome == "budget_exhausted":
+            self.console.print(
+                f"  [yellow]Found {threat_count} threats in {name} "
+                f"(budget ran out; reported in a final round)[/yellow]"
+            )
+        elif outcome == "unfinished":
+            self.console.print(
+                f"  [yellow]Found {threat_count} threats in {name} "
+                f"(the model stopped without finishing)[/yellow]"
+            )
+        else:
+            self.console.print(
+                f"  [yellow]{name}: the model's final answer could not be read. "
+                f"Recorded {threat_count} threats.[/yellow]"
+            )
 
     def tool_call(self, name: str, args_brief: str, cached: bool) -> None:
         suffix = " (cached)" if cached else ""
-        self.console.print(f"    [dim]{name}({args_brief}){suffix}[/dim]")
+        self.console.print(f"    [dim]{escape(name)}({escape(args_brief)}){suffix}[/dim]")
 
     def error(self, name: str, reason: str) -> None:
-        self.console.print(f"  [red]Error analyzing {name}: {reason}[/red]")
-
-    def limit_reached(self, kind: str, current: int, maximum: int) -> None:
-        self.console.print(
-            f"[yellow]Reached {kind} limit ({current}/{maximum}). Stopping early.[/yellow]"
-        )
+        self.console.print(f"  [red]Error analyzing {escape(name)}: {escape(reason)}[/red]")
 
     def token_budget(self, model: str, limit: int, source: str) -> None:
         if source == "queried" or source == "explicit":
@@ -97,7 +116,7 @@ class RichProgress:
 
     def no_tool_use_warning(self, subsystem: str) -> None:
         self.console.print(
-            f"  [yellow]Warning: No tool calls made for {subsystem} — "
+            f"  [yellow]Warning: No tool calls made for {escape(subsystem)} — "
             f"the model may not support function calling. "
             f"Threats are based on file names only, not actual code.[/yellow]"
         )
@@ -105,8 +124,17 @@ class RichProgress:
     def synthesis_done(self, count: int) -> None:
         self.console.print(f"  [green]Found {count} cross-cutting threats[/green]")
 
+    def synthesis_failed(self, reason: str) -> None:
+        self.console.print(
+            f"  [yellow]Synthesis failed, so this run has no cross-cutting threats. "
+            f"Subsystem findings are kept.\n  Reason: {escape(reason)}[/yellow]"
+        )
+
     def complete(self, summary: str) -> None:
-        self.console.print(Panel(summary, title="Summary", style="green"))
+        # The summary is plain text, and its token line brackets the cache
+        # split — unescaped, Rich reads "[cached: ...]" as a markup tag and
+        # drops it.
+        self.console.print(Panel(escape(summary), title="Summary", style="green"))
 
 
 class QueueProgress:
@@ -131,17 +159,15 @@ class QueueProgress:
         self._put({"type": "subsystem_start", "index": index, "total": total,
                     "name": name, "description": description})
 
-    def subsystem_done(self, name: str, threat_count: int) -> None:
-        self._put({"type": "subsystem_done", "name": name, "threat_count": threat_count})
+    def subsystem_done(self, name: str, threat_count: int, outcome: str) -> None:
+        self._put({"type": "subsystem_done", "name": name,
+                    "threat_count": threat_count, "outcome": outcome})
 
     def tool_call(self, name: str, args_brief: str, cached: bool) -> None:
         self._put({"type": "tool_call", "name": name, "args_brief": args_brief, "cached": cached})
 
     def error(self, name: str, reason: str) -> None:
         self._put({"type": "error", "name": name, "reason": reason})
-
-    def limit_reached(self, kind: str, current: int, maximum: int) -> None:
-        self._put({"type": "limit_reached", "kind": kind, "current": current, "maximum": maximum})
 
     def token_budget(self, model: str, limit: int, source: str) -> None:
         self._put({"type": "token_budget", "model": model, "limit": limit,
@@ -152,6 +178,9 @@ class QueueProgress:
 
     def synthesis_done(self, count: int) -> None:
         self._put({"type": "synthesis_done", "count": count})
+
+    def synthesis_failed(self, reason: str) -> None:
+        self._put({"type": "synthesis_failed", "reason": reason})
 
     def complete(self, summary: str) -> None:
         self._put({"type": "complete", "summary": summary})

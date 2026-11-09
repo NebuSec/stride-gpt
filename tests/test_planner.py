@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+import pytest
+
 from stride_gpt.agent.planner import (
     _build_plan,
+    _diverse_key_files,
     create_plan,
 )
 from stride_gpt.core.schemas import LLMResponse
@@ -70,6 +73,63 @@ class TestBuildPlan:
         )
         assert plan.detected_app_type == "web"
 
+    def test_null_subsystem_fields_get_the_fallbacks(self):
+        data = {"subsystems": [
+            {"name": None, "description": None, "key_files": None, "focus_areas": None},
+        ]}
+        sub = _build_plan(data, "/tmp/test").subsystems[0]
+        assert sub.name == "Unnamed"
+        assert sub.description == ""
+        assert sub.key_files == []
+        assert sub.focus_areas == []
+
+    def test_null_subsystems_falls_back_to_full_codebase(self):
+        plan = _build_plan({"subsystems": None}, "/tmp/test")
+        assert [s.name for s in plan.subsystems] == ["Full Codebase"]
+
+    @pytest.mark.parametrize("data", [{"overall_description": None}, {}])
+    def test_null_or_missing_description_is_empty(self, data):
+        plan = _build_plan({**data, "subsystems": [{"name": "A"}]}, "/tmp/test")
+        assert plan.overall_description == ""
+
+# ---------------------------------------------------------------------------
+# key-file discovery — truncation marker filtering (#180)
+# ---------------------------------------------------------------------------
+
+
+class TestKeyFileDiscovery:
+    """Discovery must see every matching file, not the first 50 per pattern.
+
+    It used search_files, which stops at MAX_SEARCH_RESULTS per pattern in
+    walk order. On OWASP Juice Shop the first 50 ``*.ts`` matches were all
+    frontend files, so the planner never saw the 61 backend route modules.
+    """
+
+    @patch("stride_gpt.agent.planner.call_llm")
+    def test_files_past_the_search_cap_reach_the_prompt(self, mock_call_llm, llm_config, tmp_path):
+        from stride_gpt.agent.tools import MAX_SEARCH_RESULTS
+
+        mock_call_llm.return_value = LLMResponse(
+            content=json.dumps({
+                "overall_description": "Test",
+                "subsystems": [{"name": "App", "description": "Main", "key_files": ["server.ts"]}],
+            }),
+        )
+        for name in ("frontend", "routes"):
+            (tmp_path / name).mkdir()
+            for i in range(MAX_SEARCH_RESULTS):
+                (tmp_path / name / f"m{i:03d}.ts").write_text("x\n")
+        (tmp_path / "node_modules").mkdir()
+        (tmp_path / "node_modules" / "dep.ts").write_text("x\n")
+
+        create_plan(llm_config, tmp_path)
+
+        prompt = mock_call_llm.call_args[0][1][1]["content"]
+        assert f"## Key Files Found ({2 * MAX_SEARCH_RESULTS} files)" in prompt
+        assert "frontend/m000.ts" in prompt
+        assert "routes/m000.ts" in prompt
+        assert "truncated" not in prompt
+
 
 # ---------------------------------------------------------------------------
 # create_plan retry behavior
@@ -113,3 +173,140 @@ class TestCreatePlanRetry:
         assert plan.subsystems[0].name == "Full Codebase"
         assert "not json" in plan.overall_description
         assert mock_call_llm.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# _diverse_key_files
+# ---------------------------------------------------------------------------
+
+
+class TestDiverseKeyFiles:
+    def test_list_under_limit_is_unchanged(self):
+        files = ["a/one.py", "b/two.py"]
+        assert _diverse_key_files(files, 200) == files
+
+    def test_round_robins_across_directories(self):
+        early = [f"aaa/f{i:03d}.py" for i in range(200)]
+        late = [f"zzz/f{i:03d}.py" for i in range(10)]
+        sample = _diverse_key_files(early + late, 200)
+        assert len(sample) == 200
+        assert set(late).issubset(sample)
+
+    def test_round_robins_when_directory_count_exceeds_the_limit(self):
+        # PR #178 review: 250 nested leaf directories under one subsystem
+        # must not starve a sibling subsystem of every file, the same
+        # failure as #175 moved from file granularity to directory
+        # granularity.
+        web = [f"services/web/src/mod{i:03d}/index.js" for i in range(250)]
+        workshop = [f"services/workshop/f{i:03d}.py" for i in range(56)]
+        sample = _diverse_key_files(web + workshop, 200)
+        web_count = sum(1 for f in sample if f.startswith("services/web/"))
+        workshop_count = sum(1 for f in sample if f.startswith("services/workshop/"))
+        assert len(sample) == 200
+        assert web_count == 144
+        assert workshop_count == 56
+
+    def test_round_robins_when_the_subsystem_boundary_is_one_level_up(self):
+        # PR #178 review, second round: grouping by a fixed depth just
+        # relocates the #178 failure to whatever depth the real subsystem
+        # boundary is not at. 250 directories nested one level under `web/`
+        # must not starve a sibling `workshop/` directory that never nests
+        # at all, pinning the fix at depth 1 as well as depth 2.
+        web = [f"web/pkg{i:03d}/index.js" for i in range(250)]
+        workshop = [f"workshop/f{i:03d}.py" for i in range(56)]
+        sample = _diverse_key_files(web + workshop, 200)
+        web_count = sum(1 for f in sample if f.startswith("web/"))
+        workshop_count = sum(1 for f in sample if f.startswith("workshop/"))
+        assert len(sample) == 200
+        assert web_count == 144
+        assert workshop_count == 56
+
+    def test_round_robins_root_level_files_against_a_nested_tree(self):
+        web = [f"a{i:03d}.py" for i in range(100)]
+        workshop = [f"nested/deep/tree/b{i:03d}.py" for i in range(100)]
+        sample = _diverse_key_files(web + workshop, 200)
+        assert len(sample) == 200
+        assert sum(1 for f in sample if "/" not in f) == 100
+        assert sum(1 for f in sample if f.startswith("nested/")) == 100
+
+
+# ---------------------------------------------------------------------------
+# create_plan key-file coverage (issue #175)
+# ---------------------------------------------------------------------------
+
+
+class TestCreatePlanKeyFileCoverage:
+    @patch("stride_gpt.agent.planner.call_llm")
+    def test_late_sorting_directory_reaches_the_prompt(self, mock_call_llm, llm_config, tmp_path):
+        mock_call_llm.return_value = LLMResponse(
+            content=json.dumps({
+                "overall_description": "Test",
+                "subsystems": [{"name": "App", "description": "Main", "key_files": ["app.py"]}],
+            }),
+            thinking=None, reasoning=None, model="test",
+        )
+        extensions = [".py", ".js", ".ts", ".go", ".rs"]
+        (tmp_path / "service_early").mkdir()
+        for ext in extensions:
+            for i in range(40):
+                (tmp_path / "service_early" / f"f{i:03d}{ext}").write_text("x\n")
+        (tmp_path / "service_late").mkdir()
+        for ext in extensions:
+            for i in range(2):
+                (tmp_path / "service_late" / f"f{i:03d}{ext}").write_text("x\n")
+
+        create_plan(llm_config, tmp_path)
+
+        prompt = mock_call_llm.call_args[0][1][1]["content"]
+        assert "service_late/f000.py" in prompt
+
+
+# ---------------------------------------------------------------------------
+# create_plan directory overview (issue #175)
+# ---------------------------------------------------------------------------
+
+
+class TestCreatePlanDirectoryOverview:
+    @patch("stride_gpt.agent.planner.call_llm")
+    def test_lists_children_of_top_level_directories(self, mock_call_llm, llm_config, tmp_path):
+        mock_call_llm.return_value = LLMResponse(
+            content=json.dumps({"overall_description": "Test", "subsystems": [{"name": "App"}]}),
+        )
+        for name in ("a", "b"):
+            (tmp_path / "services" / name / "deeper").mkdir(parents=True)
+        (tmp_path / "services" / "node_modules").mkdir()
+        (tmp_path / "node_modules").mkdir()
+        (tmp_path / "README.md").write_text("x\n")
+
+        create_plan(llm_config, tmp_path)
+
+        prompt = mock_call_llm.call_args[0][1][1]["content"]
+        listing = prompt.split("## Directory Structure\n", 1)[1].split("\n\n", 1)[0]
+        assert listing.splitlines() == ["README.md", "services/", "  a/", "  b/"]
+
+
+class TestCreatePlanKeyFileCounts:
+    @patch("stride_gpt.agent.planner.call_llm")
+    def test_counts_recorded_when_truncated(self, mock_call_llm, llm_config, tmp_path):
+        from stride_gpt.agent.planner import KEY_FILE_SAMPLE_LIMIT
+
+        mock_call_llm.return_value = LLMResponse(
+            content=json.dumps({"overall_description": "Test", "subsystems": [{"name": "App"}]}),
+        )
+        for i in range(KEY_FILE_SAMPLE_LIMIT + 10):
+            (tmp_path / f"f{i:03d}.py").write_text("x\n")
+
+        plan = create_plan(llm_config, tmp_path)
+
+        assert plan.key_files_found == KEY_FILE_SAMPLE_LIMIT + 10
+        assert plan.key_files_shown == KEY_FILE_SAMPLE_LIMIT
+
+    @patch("stride_gpt.agent.planner.call_llm")
+    def test_counts_recorded_on_unparseable_plan(self, mock_call_llm, llm_config, tmp_path):
+        mock_call_llm.return_value = LLMResponse(content="not json")
+        (tmp_path / "app.py").write_text("x\n")
+
+        plan = create_plan(llm_config, tmp_path)
+
+        assert plan.subsystems[0].name == "Full Codebase"
+        assert (plan.key_files_found, plan.key_files_shown) == (1, 1)
