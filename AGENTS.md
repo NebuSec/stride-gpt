@@ -168,6 +168,8 @@ Models are registered in `stride_gpt/models.py` with provider, default tokens, m
 - **Reasoning is carried between requests.** With `store=False` nothing stays server-side, so reasoning models are asked for `reasoning.encrypted_content`; `assistant_tool_turn` keeps the items on the history message and `messages_to_responses_input` sends them back before their calls.
   Build a tool-calling assistant message with `assistant_tool_turn`, never by hand, or the model loses its reasoning between rounds.
   `count_message_tokens` does not count these items.
+- **JSON mode (`json_object`) needs the word "json" in `input`**; `instructions` does not count.
+  When only the system message asks for JSON, `_responses_call_kwargs` sends it as the first `input` item instead of as `instructions`.
 - **A gateway route names no model**, so the registry can't know its context window: pass `--worker-context-window` / `--architect-context-window` (`LLMConfig.context_window`).
 - **The SDK has no context-overflow exception.** It arrives as a 400, told apart by `code` or wording in `agent/errors.py:_is_context_overflow`.
 

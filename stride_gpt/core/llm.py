@@ -229,6 +229,18 @@ def _responses_call_kwargs(
 ) -> dict:
     """Kwargs for client.responses.create()."""
     instructions, input_items = messages_to_responses_input(messages)
+    text_format = None if tools else _responses_text_format(config)
+    if (
+        instructions
+        and text_format is not None
+        and text_format["format"]["type"] == "json_object"
+        and not _mentions_json(input_items)
+    ):
+        # JSON mode requires the word "json" in `input`; `instructions` does
+        # not count. A prompt that asks for JSON only in its system message
+        # would be refused, so that message goes first in `input` instead.
+        input_items = [{"role": "system", "content": instructions}, *input_items]
+        instructions = None
     kwargs: dict = {
         "model": config.model_name,
         "input": input_items,
@@ -244,11 +256,16 @@ def _responses_call_kwargs(
         kwargs["include"] = [_REASONING_INCLUDE]
     if tools:
         kwargs["tools"] = _to_responses_tools(tools)
-    else:
-        text_format = _responses_text_format(config)
-        if text_format is not None:
-            kwargs["text"] = text_format
+    elif text_format is not None:
+        kwargs["text"] = text_format
     return kwargs
+
+
+def _mentions_json(input_items: list[dict]) -> bool:
+    """Whether any input item's text contains "json", as JSON mode requires."""
+    return "json" in _json.dumps(
+        [item.get("content") for item in input_items if "content" in item]
+    ).lower()
 
 
 def _keeps_reasoning(config: LLMConfig) -> bool:
