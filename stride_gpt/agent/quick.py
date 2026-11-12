@@ -17,7 +17,7 @@ from pathlib import Path
 
 from stride_gpt.agent.tools import AGENT_TOOLS, execute_tool
 from stride_gpt.core.json_extract import extract_json_object
-from stride_gpt.core.llm import call_llm, call_llm_with_tools
+from stride_gpt.core.llm import assistant_tool_turn, call_llm, call_llm_with_tools
 from stride_gpt.core.prompts import quick_base_prompt
 from stride_gpt.core.schemas import LLMConfig, ModelPair, ThreatModelOutput
 
@@ -81,16 +81,7 @@ def run_quick_analysis(
         llm_calls += 1
 
         if response.tool_calls:
-            messages.append({
-                "role": "assistant",
-                "content": response.content or "",
-                "tool_calls": [
-                    {"id": tc.id, "type": "function",
-                     "function": {"name": tc.function_name,
-                                  "arguments": json.dumps(tc.arguments)}}
-                    for tc in response.tool_calls
-                ],
-            })
+            messages.append(assistant_tool_turn(response))
             for tc in response.tool_calls:
                 key = tc.function_name + ":" + json.dumps(tc.arguments, sort_keys=True)
                 if not tc.parse_error and key in tool_cache:

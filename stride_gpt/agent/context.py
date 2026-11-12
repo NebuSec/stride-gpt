@@ -91,6 +91,7 @@ class ContextManager:
 
     def __init__(self, config: LLMConfig, context_window: int | None = None):
         self.model = config.model_name
+        context_window = context_window or config.context_window
         if context_window:
             self.context_window = context_window
             self.budget_source = TokenBudgetSource.EXPLICIT

@@ -109,6 +109,28 @@ class TestBuildModelPair:
         assert pair.worker.api_key == "sk-worker"
         assert pair.architect is None
 
+    def test_context_windows_and_call_timeout_reach_both_tiers(self, monkeypatch):
+        monkeypatch.setattr(cli, "load_config", lambda: None)
+        pair = cli._build_model_pair(
+            worker_model="openai/route-a",
+            worker_api_key="k",
+            architect_model="openai/route-b",
+            architect_api_key="k",
+            worker_context_window=272_000,
+            architect_context_window=400_000,
+            call_timeout=900,
+        )
+        assert (pair.worker.context_window, pair.worker.timeout) == (272_000, 900)
+        assert (pair.architect.context_window, pair.architect.timeout) == (400_000, 900)
+
+    def test_architect_context_window_without_model_exits_2(self, monkeypatch):
+        monkeypatch.setattr(cli, "load_config", lambda: None)
+        with pytest.raises(typer.Exit) as exc:
+            cli._build_model_pair(
+                worker_model="openai/gpt-x", worker_api_key="k", architect_context_window=1000
+            )
+        assert exc.value.exit_code == 2
+
     def test_worker_falls_back_to_saved_config(self, monkeypatch):
         saved = {
             "worker_provider_key": "OpenAI API",

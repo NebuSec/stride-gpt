@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 from dotenv import load_dotenv
 
 from stride_gpt.config import CONFIG_DIR
+from stride_gpt.core.schemas import DEFAULT_CALL_TIMEOUT_SECONDS
 
 load_dotenv(CONFIG_DIR / ".env")  # Load API keys from ~/.stride-gpt/.env
 
@@ -1039,6 +1040,9 @@ def analyze(
     architect_api_base: Annotated[str | None, typer.Option(help="Architect API base URL (a Responses-compatible endpoint).")] = None,
     architect_max_tokens: Annotated[int | None, typer.Option(help="Architect per-call output token cap.")] = None,
     no_architect: Annotated[bool, typer.Option("--no-architect", help="Bypass any saved architect tier for this run; worker handles every call.")] = False,
+    worker_context_window: Annotated[int | None, typer.Option(min=1, help="Worker context window in tokens. Needed when the model id names a gateway route the model registry can't know; otherwise looked up.")] = None,
+    architect_context_window: Annotated[int | None, typer.Option(min=1, help="Architect context window in tokens; see --worker-context-window.")] = None,
+    call_timeout: Annotated[int | None, typer.Option(min=1, help=f"Seconds one model call may take, whole stream included (default {DEFAULT_CALL_TIMEOUT_SECONDS}).")] = None,
     output: Annotated[Path | None, typer.Option("-o", "--output", help="Output file path.")] = None,
     output_format: Annotated[OutputFormat, typer.Option("-f", "--format", help="Output format.")] = OutputFormat.markdown,
     max_llm_calls: Annotated[int, typer.Option(help="Max LLM calls per subsystem; a subsystem that hits it gets one final round to report what it found, so none is skipped. The default is about twice the ~12 rounds per subsystem a measured full run took (0 = unlimited).")] = DEFAULT_MAX_LLM_CALLS,
@@ -1066,6 +1070,9 @@ def analyze(
         architect_api_base=architect_api_base,
         architect_max_tokens=architect_max_tokens,
         no_architect=no_architect,
+        worker_context_window=worker_context_window,
+        architect_context_window=architect_context_window,
+        call_timeout=call_timeout,
     )
 
     target = path.resolve()
@@ -1437,6 +1444,9 @@ def _build_model_pair(
     architect_api_base: str | None = None,
     architect_max_tokens: int | None = None,
     no_architect: bool = False,
+    worker_context_window: int | None = None,
+    architect_context_window: int | None = None,
+    call_timeout: int | None = None,
 ):
     """Build a ModelPair from CLI flags, falling back to saved config + env vars.
 
@@ -1452,6 +1462,7 @@ def _build_model_pair(
 
     architect_flag_set = any([
         architect_model, architect_api_key, architect_api_base, architect_max_tokens,
+        architect_context_window,
     ])
     if architect_flag_set and not architect_model:
         console.print("[red]--architect-* flags require --architect-model.[/red]")
@@ -1490,6 +1501,8 @@ def _build_model_pair(
         api_key=worker_key or "",
         api_base=worker_api_base,
         max_tokens=worker_max_tokens,
+        timeout=call_timeout,
+        context_window=worker_context_window,
     )
 
     # ---- Architect tier ----
@@ -1511,9 +1524,13 @@ def _build_model_pair(
             api_key=a_key,
             api_base=architect_api_base,
             max_tokens=architect_max_tokens,
+            timeout=call_timeout,
+            context_window=architect_context_window,
         )
     elif saved and saved.get("architect_model"):
         architect = _tier_to_llm_config_from_saved(saved, "architect")
+        if architect is not None and call_timeout:
+            architect = architect.model_copy(update={"timeout": call_timeout})
         if architect is None:
             # Saved architect block present but couldn't be built — usually a missing key.
             architect_provider = saved.get("architect_provider", "")

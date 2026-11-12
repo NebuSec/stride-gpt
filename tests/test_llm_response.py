@@ -22,9 +22,26 @@ def _reply(**fields):
     return SimpleNamespace(**fields)
 
 
+class _Stream:
+    """A Responses stream that delivers ``response`` as response.completed."""
+
+    def __init__(self, response):
+        self.response = SimpleNamespace(request=None)
+        self._events = [SimpleNamespace(type="response.completed", response=response)]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __iter__(self):
+        return iter(self._events)
+
+
 def _call(config, response, tools=None):
     client = MagicMock()
-    client.responses.create.return_value = response
+    client.responses.create.return_value = _Stream(response)
     with patch("stride_gpt.core.llm.OpenAI", return_value=client):
         return _call_responses(config, [{"role": "user", "content": "hi"}], tools=tools)
 
