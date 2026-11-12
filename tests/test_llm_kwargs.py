@@ -60,6 +60,21 @@ class TestResponsesCallKwargs:
         kwargs = _responses_call_kwargs(cfg, [{"role": "user", "content": "hi"}])
         assert kwargs["text"] == {"format": {"type": "json_object"}}
 
+    def test_json_schema_is_sent_non_strict(self):
+        """Strict mode needs additionalProperties: false on every object, which
+        a Pydantic schema lacks; left unset, strict now defaults to True."""
+        from stride_gpt.core.schemas import AnalysisPlan
+
+        cfg = LLMConfig(
+            provider="OpenAI API",
+            model_name="gpt-6-sol",
+            api_key="fake",
+            response_format=AnalysisPlan.model_json_schema(),
+        )
+        kwargs = _responses_call_kwargs(cfg, [{"role": "user", "content": "hi"}])
+        assert kwargs["text"]["format"]["type"] == "json_schema"
+        assert kwargs["text"]["format"]["strict"] is False
+
     def test_tools_skip_json_format(self):
         cfg = LLMConfig(
             provider="OpenAI API",
@@ -87,6 +102,7 @@ class TestResponsesCallKwargs:
                 "name": "read_file",
                 "description": "Read a file",
                 "parameters": {"type": "object", "properties": {}},
+                "strict": False,
             }
         ]
 
@@ -154,7 +170,7 @@ class TestMessagesToResponsesInput:
         )
         assert items[0]["content"] == [
             {"type": "input_text", "text": "describe"},
-            {"type": "input_image", "image_url": "data:image/png;base64,abc"},
+            {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "auto"},
         ]
 
 
@@ -184,6 +200,7 @@ class TestToResponsesTools:
                     "properties": {"pattern": {"type": "string"}},
                     "required": ["pattern"],
                 },
+                "strict": False,
             }
         ]
 
@@ -267,3 +284,54 @@ class TestJsonModeGuardrail:
     def test_json_schema_mode_has_no_such_rule(self):
         kwargs = self._kwargs("Be terse.", "go", response_format={"type": "object"})
         assert kwargs["instructions"] == "Be terse."
+
+
+def _cfg(model="gpt-6-sol", **kw):
+    return LLMConfig(provider="OpenAI API", model_name=model, api_key="k", **kw)
+
+
+class TestSpecAlignment:
+    """Fields the Responses API requires, and defaults LiteLLM applied before."""
+
+    def test_an_unregistered_model_gets_no_output_cap(self):
+        kwargs = _responses_call_kwargs(_cfg("gateway-route"), [{"role": "user", "content": "hi"}])
+        assert "max_output_tokens" not in kwargs
+
+    def test_an_explicit_cap_still_applies(self):
+        kwargs = _responses_call_kwargs(
+            _cfg("gateway-route", max_tokens=4000), [{"role": "user", "content": "hi"}]
+        )
+        assert kwargs["max_output_tokens"] == 4000
+
+    def test_function_tools_carry_strict_false(self):
+        tools = _to_responses_tools(
+            [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]
+        )
+        assert tools[0]["strict"] is False
+
+    def test_a_tool_that_asks_for_strict_keeps_it(self):
+        tools = _to_responses_tools(
+            [{"type": "function", "function": {"name": "f", "strict": True}}]
+        )
+        assert tools[0]["strict"] is True
+
+    def test_images_carry_detail(self):
+        _, items = messages_to_responses_input([{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA", "detail": "high"}},
+        ]}])
+        assert [part["detail"] for part in items[0]["content"]] == ["auto", "high"]
+
+    def test_a_later_system_message_stays_in_input(self):
+        instructions, items = messages_to_responses_input([
+            {"role": "system", "content": "rules"},
+            {"role": "user", "content": "go"},
+            {"role": "system", "content": "late note"},
+        ])
+        assert instructions == "rules"
+        assert items[-1] == {"role": "system", "content": "late note"}
+
+    def test_a_system_only_request_is_sent_as_input(self):
+        instructions, items = messages_to_responses_input([{"role": "system", "content": "only"}])
+        assert instructions is None
+        assert items == [{"role": "system", "content": "only"}]
