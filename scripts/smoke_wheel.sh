@@ -50,8 +50,17 @@ import httpx
 from stride_gpt.core import llm
 from stride_gpt.core.schemas import LLMConfig
 
+import json
+
+# Every call streams; the call ends on response.completed.
+completed = {"type": "response.completed", "sequence_number": 0,
+             "response": {"id": "r", "object": "response", "output": []}}
+
 def handler(_request):
-    return httpx.Response(200, json={"id": "r", "object": "response", "output": []})
+    return httpx.Response(
+        200, headers={"content-type": "text/event-stream"},
+        content=f"event: response.completed\ndata: {json.dumps(completed)}\n\n".encode(),
+    )
 
 real = llm.OpenAI
 llm.OpenAI = lambda **kw: real(

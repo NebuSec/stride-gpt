@@ -159,7 +159,16 @@ Models are registered in `stride_gpt/models.py` with provider, default tokens, m
 
 - **Responses must set `store=False`.** Default storage would persist threat-model prompts (including source) on OpenAI's side.
 - **GPT-5 and later use `max_output_tokens` on Responses.** Driven off `_default_output_tokens` and the model registry.
-- **Retries belong to the SDK** (`max_retries` in `_client_kwargs`): 408, 429, 5xx and dropped connections, honouring `Retry-After`.
+- **Every call streams** (`_stream_response`), and the call ends on `response.completed` (or `response.incomplete`).
+  A non-streamed answer sends no response headers until it is complete, and a gateway with a response-header timeout fails a slow answer from a working model.
+- **Retries before a response starts belong to the SDK** (`max_retries` in `_client_kwargs`): 408, 429, 5xx and dropped connections, honouring `Retry-After`.
+  **A stream that dies after it started** (a dropped connection, a read timeout, a stream that ends without `response.completed`, an error code in `_DEAD_STREAM_CODES` such as a gateway's `request_timeout`) is retried by `_stream_response`, `STREAM_ATTEMPTS` in all; the SDK never retries those.
+  Other errors (a refused request, `response.failed` with any other code) are raised at once.
+- **Each call is bounded by `LLMConfig.timeout`** (`--call-timeout`, default `DEFAULT_CALL_TIMEOUT_SECONDS`): each silent read, and the whole stream, since a stream that keeps sending events never trips a read timeout.
+- **Reasoning is carried between requests.** With `store=False` nothing stays server-side, so reasoning models are asked for `reasoning.encrypted_content`; `assistant_tool_turn` keeps the items on the history message and `messages_to_responses_input` sends them back before their calls.
+  Build a tool-calling assistant message with `assistant_tool_turn`, never by hand, or the model loses its reasoning between rounds.
+  `count_message_tokens` does not count these items.
+- **A gateway route names no model**, so the registry can't know its context window: pass `--worker-context-window` / `--architect-context-window` (`LLMConfig.context_window`).
 - **The SDK has no context-overflow exception.** It arrives as a 400, told apart by `code` or wording in `agent/errors.py:_is_context_overflow`.
 
 ## Adding a feature — orientation

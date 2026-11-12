@@ -5,12 +5,14 @@ from __future__ import annotations
 import pytest
 
 from stride_gpt.core.llm import (
+    DEFAULT_CALL_TIMEOUT_SECONDS,
     _client_kwargs,
     _responses_call_kwargs,
     _to_responses_tools,
+    assistant_tool_turn,
     messages_to_responses_input,
 )
-from stride_gpt.core.schemas import LLMConfig
+from stride_gpt.core.schemas import LLMConfig, LLMResponse, ToolCallResult
 
 
 class TestClientKwargs:
@@ -184,3 +186,56 @@ class TestToResponsesTools:
                 },
             }
         ]
+
+
+class TestCallTimeout:
+    def test_defaults_when_unset(self):
+        config = LLMConfig(provider="OpenAI API", model_name="gpt-6-sol", api_key="k")
+        assert _client_kwargs(config)["timeout"] == DEFAULT_CALL_TIMEOUT_SECONDS
+
+    def test_config_sets_it(self):
+        config = LLMConfig(provider="OpenAI API", model_name="gpt-6-sol", api_key="k", timeout=90)
+        assert _client_kwargs(config)["timeout"] == 90
+
+
+_ITEM = {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "opaque"}
+
+
+class TestReasoningReplay:
+
+    def _response(self, reasoning):
+        return LLMResponse(
+            content="",
+            tool_calls=[ToolCallResult(id="call_1", function_name="read_file",
+                                       arguments={"path": "a.py"})],
+            reasoning_items=reasoning,
+        )
+
+    def test_tool_turn_carries_the_reasoning(self):
+        turn = assistant_tool_turn(self._response([_ITEM]))
+        assert turn["reasoning_items"] == [_ITEM]
+        assert turn["tool_calls"][0]["function"] == {
+            "name": "read_file", "arguments": '{"path": "a.py"}'}
+
+    def test_tool_turn_without_reasoning_has_no_key(self):
+        assert "reasoning_items" not in assistant_tool_turn(self._response(None))
+
+    def test_reasoning_goes_back_before_its_calls(self):
+        _, items = messages_to_responses_input([
+            {"role": "user", "content": "go"},
+            assistant_tool_turn(self._response([_ITEM])),
+            {"role": "tool", "tool_call_id": "call_1", "name": "read_file", "content": "x"},
+        ])
+        assert [item.get("type", item.get("role")) for item in items] == [
+            "user", "reasoning", "function_call", "function_call_output"]
+        assert items[1] == _ITEM
+
+    def test_reasoning_models_ask_for_encrypted_reasoning(self):
+        config = LLMConfig(provider="OpenAI API", model_name="gpt-6-sol", api_key="k")
+        kwargs = _responses_call_kwargs(config, [{"role": "user", "content": "hi"}])
+        assert kwargs["include"] == ["reasoning.encrypted_content"]
+
+    def test_an_unknown_route_asks_too(self):
+        config = LLMConfig(provider="OpenAI API", model_name="some-gateway-route", api_key="k")
+        kwargs = _responses_call_kwargs(config, [{"role": "user", "content": "hi"}])
+        assert kwargs["include"] == ["reasoning.encrypted_content"]

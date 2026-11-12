@@ -6,11 +6,32 @@ Agent history stays in Chat Completions shape and is converted at this boundary.
 from __future__ import annotations
 
 import json as _json
+import logging
+import time
 
+import openai
 from openai import OpenAI
 
-from stride_gpt.core.schemas import LLMConfig, LLMResponse, ToolCallResult
+from stride_gpt.core.schemas import (
+    DEFAULT_CALL_TIMEOUT_SECONDS,
+    LLMConfig,
+    LLMResponse,
+    ToolCallResult,
+)
 from stride_gpt.models import get_model, get_provider_by_key, model_uses_completion_tokens
+
+logger = logging.getLogger(__name__)
+
+# Attempts at one call whose stream died. The SDK's own retries cover a request
+# that failed before its response started; nothing else retries one that died
+# mid-stream, and a failed call costs the agent loop a whole subsystem.
+STREAM_ATTEMPTS = 3
+# Error codes that mean the stream died, not that the request was wrong. A
+# gateway that cuts a stalled stream reports request_timeout, as a 400 or an
+# error event; the same request then usually finishes in seconds.
+_DEAD_STREAM_CODES = frozenset({"request_timeout", "server_error"})
+_REASONING_INCLUDE = "reasoning.encrypted_content"
+_sleep = time.sleep  # the backoff between stream attempts; tests replace it
 
 
 def _default_output_tokens(config: LLMConfig, fallback: int) -> int:
@@ -67,12 +88,16 @@ def _client_kwargs(config: LLMConfig) -> dict:
     kwargs: dict = {
         "api_key": config.api_key or None,
         "max_retries": 3,
+        "timeout": call_timeout(config),
     }
-    if config.timeout:
-        kwargs["timeout"] = config.timeout
     if config.api_base:
         kwargs["base_url"] = config.api_base.rstrip("/")
     return kwargs
+
+
+def call_timeout(config: LLMConfig) -> int:
+    """Seconds one call may take; see DEFAULT_CALL_TIMEOUT_SECONDS."""
+    return config.timeout if config.timeout and config.timeout > 0 else DEFAULT_CALL_TIMEOUT_SECONDS
 
 
 def _openai_client(config: LLMConfig) -> OpenAI:
@@ -169,6 +194,10 @@ def messages_to_responses_input(messages: list[dict]) -> tuple[str | None, list[
             continue
 
         if role == "assistant" and msg.get("tool_calls"):
+            # The reasoning behind these calls goes back before them, as the
+            # model produced it: without it the model starts every round of a
+            # tool loop with no memory of why it made its previous calls.
+            items.extend(msg.get("reasoning_items") or [])
             if isinstance(content, str) and content:
                 items.append({"role": "assistant", "content": content})
             for tc in msg["tool_calls"]:
@@ -208,6 +237,11 @@ def _responses_call_kwargs(
     }
     if instructions:
         kwargs["instructions"] = instructions
+    if _keeps_reasoning(config):
+        # store=False keeps nothing server-side, so the model's reasoning only
+        # carries into the next request if it comes back encrypted and is sent
+        # again (messages_to_responses_input).
+        kwargs["include"] = [_REASONING_INCLUDE]
     if tools:
         kwargs["tools"] = _to_responses_tools(tools)
     else:
@@ -215,6 +249,53 @@ def _responses_call_kwargs(
         if text_format is not None:
             kwargs["text"] = text_format
     return kwargs
+
+
+def _keeps_reasoning(config: LLMConfig) -> bool:
+    """Whether to ask for the model's encrypted reasoning.
+
+    Models the registry knows not to reason are left out: they have no
+    reasoning to return. A model it doesn't know (often a gateway route) is
+    asked, since every current OpenAI model reasons.
+    """
+    registered = get_model(config.provider, config.model_name)
+    return registered is None or registered.uses_max_completion_tokens
+
+
+def _responses_reasoning_items(response) -> list[dict] | None:
+    """The response's reasoning items, as input items for the next request."""
+    items: list[dict] = []
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) != "reasoning":
+            continue
+        payload = item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else dict(item)
+        # Output-only field: the API refuses it on an input item.
+        payload.pop("status", None)
+        items.append(payload)
+    return items or None
+
+
+def assistant_tool_turn(response: LLMResponse) -> dict:
+    """The history message for a response that called tools.
+
+    Carries the response's reasoning, which ``messages_to_responses_input``
+    sends back with the next request.
+    """
+    message: dict = {
+        "role": "assistant",
+        "content": response.content or "",
+        "tool_calls": [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {"name": tc.function_name, "arguments": _json.dumps(tc.arguments)},
+            }
+            for tc in response.tool_calls or []
+        ],
+    }
+    if response.reasoning_items:
+        message["reasoning_items"] = response.reasoning_items
+    return message
 
 
 def _responses_text(response) -> str:
@@ -335,15 +416,104 @@ def _call_responses(
     """Call OpenAI via the Responses API."""
     client = _openai_client(config)
     kwargs = _responses_call_kwargs(config, messages, tools)
-    response = client.responses.create(**kwargs)
+    response = _stream_response(client, kwargs, call_timeout(config))
 
     return LLMResponse(
         content=_responses_text(response),
         thinking=_responses_thinking(response),
         model=config.model_name,
         tool_calls=_responses_tool_calls(response) if tools else None,
+        reasoning_items=_responses_reasoning_items(response),
         **_extract_usage(response),
     )
+
+
+def _stream_died(error: openai.APIError, *, opened: bool) -> bool:
+    """Whether ``error`` lost a stream rather than refused the request.
+
+    A refusal (a bad request, a rate limit, a context overflow) would fail the
+    same way again. A connection error before the stream opened has already
+    been retried by the SDK, so retrying it here would only multiply attempts.
+    """
+    if isinstance(error, openai.APIConnectionError):  # also APITimeoutError
+        return opened
+    return getattr(error, "code", None) in _DEAD_STREAM_CODES
+
+
+def _event_error(event, request) -> openai.APIError | None:
+    """The error an ``error`` or ``response.failed`` event reports, if any.
+
+    The SDK raises only for a top-level ``error`` key; these carry theirs
+    elsewhere and arrive as ordinary events.
+    """
+    kind = getattr(event, "type", None)
+    if kind == "error":
+        body = {"code": getattr(event, "code", None), "message": getattr(event, "message", "")}
+    elif kind == "response.failed":
+        error = getattr(getattr(event, "response", None), "error", None)
+        body = {
+            "code": getattr(error, "code", None),
+            "message": getattr(error, "message", None) or "The response failed.",
+        }
+    else:
+        return None
+    return openai.APIError(body["message"] or "The model stream failed.", request, body=body)
+
+
+def _read_stream(client: OpenAI, kwargs: dict, limit: float, opened: list[bool]):
+    """One streamed call: its final Response, or the error that ended it.
+
+    Sets ``opened[0]`` once the response has started.
+    """
+    started = time.monotonic()
+    stream = client.responses.create(**kwargs, stream=True)
+    opened[0] = True
+    request = stream.response.request
+    with stream:
+        for event in stream:
+            if time.monotonic() - started > limit:
+                # Events kept coming, so no read ever timed out.
+                raise openai.APITimeoutError(request)
+            error = _event_error(event, request)
+            if error is not None:
+                raise error
+            if getattr(event, "type", None) in ("response.completed", "response.incomplete"):
+                return event.response
+    raise openai.APIError(
+        "The model stream ended before the response completed.",
+        request,
+        body={"code": "server_error", "message": "stream ended before response.completed"},
+    )
+
+
+def _stream_response(client: OpenAI, kwargs: dict, limit: float):
+    """Stream one Responses call and return the final Response.
+
+    Every call streams, so a gateway that times out waiting for response
+    headers never mistakes a slow answer for a silent one. ``limit`` bounds
+    the whole stream as well as each silent read: a stream can keep sending
+    events for as long as it likes, and a read timeout alone never ends it.
+
+    A stream that dies (see ``_stream_died``) is retried up to STREAM_ATTEMPTS
+    times in all, with a short backoff; any other error is raised at once.
+    """
+    for attempt in range(1, STREAM_ATTEMPTS + 1):
+        started = time.monotonic()
+        opened = [False]
+        try:
+            return _read_stream(client, kwargs, limit, opened)
+        except openai.APIError as error:
+            if attempt == STREAM_ATTEMPTS or not _stream_died(error, opened=opened[0]):
+                raise
+            logger.warning(
+                "Model stream died after %.0fs (attempt %d of %d), retrying: %s",
+                time.monotonic() - started,
+                attempt,
+                STREAM_ATTEMPTS,
+                str(error)[:300],
+            )
+            _sleep(2**attempt)
+    raise AssertionError("unreachable")
 
 
 def _image_messages(

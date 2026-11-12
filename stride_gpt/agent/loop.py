@@ -29,7 +29,7 @@ from stride_gpt.agent.tools import (
     execute_tool,
 )
 from stride_gpt.core.json_extract import extract_json_object
-from stride_gpt.core.llm import call_llm, call_llm_with_tools
+from stride_gpt.core.llm import assistant_tool_turn, call_llm, call_llm_with_tools
 from stride_gpt.core.prompts import base_system_prompt
 from stride_gpt.core.schemas import (
     ANALYSED_OUTCOMES,
@@ -967,21 +967,7 @@ The files listed above belong to those subsystems. You can read them to understa
                 continue
             nudged = False
 
-            messages.append({
-                "role": "assistant",
-                "content": response.content or "",
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function_name,
-                            "arguments": json.dumps(tc.arguments),
-                        },
-                    }
-                    for tc in response.tool_calls
-                ],
-            })
+            messages.append(assistant_tool_turn(response))
             for tc in response.tool_calls:
                 messages.append({
                     "role": "tool",
@@ -1062,18 +1048,7 @@ def _grace_round(
         run.take_text_fallback(response.content)
         return
 
-    grace_msgs.append({
-        "role": "assistant",
-        "content": response.content or "",
-        "tool_calls": [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {"name": tc.function_name, "arguments": json.dumps(tc.arguments)},
-            }
-            for tc in response.tool_calls
-        ],
-    })
+    grace_msgs.append(assistant_tool_turn(response))
     for tc in response.tool_calls:
         grace_msgs.append({
             "role": "tool",

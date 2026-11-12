@@ -7,6 +7,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
+# Seconds one model call may take when LLMConfig.timeout is unset: each silent
+# read, and the whole stream. 20 minutes is past any answer a model gateway lets
+# run (a common one cuts streams at 15).
+DEFAULT_CALL_TIMEOUT_SECONDS = 1200
+
 
 class LLMConfig(BaseModel):
     """Configuration for an LLM call. Constructed by UI layer from session state."""
@@ -15,7 +20,13 @@ class LLMConfig(BaseModel):
     model_name: str  # bare name e.g. "gpt-6-sol"
     api_key: str  # BYOK key, passed per-call
     api_base: str | None = None  # Custom Responses-compatible endpoint
-    timeout: int | None = None  # Request timeout in seconds
+    # Bounds one model call, in seconds: each silent read, and the whole stream
+    # (see core/llm.py). None means DEFAULT_CALL_TIMEOUT_SECONDS.
+    timeout: int | None = None
+    # The model's context window, in tokens, when the caller knows it. A model
+    # id can name a gateway route rather than a model, and then no lookup by
+    # name can know the window; None means look it up (agent/context.py).
+    context_window: int | None = None
     max_tokens: int | None = None  # Override default max tokens
     response_format: str | dict = "text"  # "text", "json", or a JSON schema dict
 
@@ -40,6 +51,9 @@ class LLMResponse:
     thinking: str | None = None  # Responses API reasoning summaries
     reasoning: str | None = None  # Unset on the Responses path
     model: str = ""  # Model that actually responded
+    # The response's reasoning items, with their encrypted content, for the
+    # next request of the same conversation (requests are not stored).
+    reasoning_items: list[dict[str, Any]] | None = None
     tool_calls: list[ToolCallResult] | None = None
     # Usage the provider reported for this call. ``None`` means the provider
     # didn't report it — kept distinct from ``0`` so callers never mistake

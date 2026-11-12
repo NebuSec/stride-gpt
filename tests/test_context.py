@@ -10,6 +10,7 @@ from stride_gpt.agent.context import (
     DEFAULT_LIMITS,
     SUMMARY_HEADER,
     ContextManager,
+    TokenBudgetSource,
 )
 from stride_gpt.core.schemas import LLMConfig, LLMResponse
 
@@ -83,6 +84,13 @@ class TestResolveLimit:
     def test_explicit_override(self):
         ctx = ContextManager(config=_make_config(), context_window=50_000)
         assert ctx.context_window == 50_000
+
+    def test_window_on_the_config(self):
+        """A gateway route names no model, so the caller states the window."""
+        config = _make_config("route-to-anything").model_copy(update={"context_window": 400_000})
+        ctx = ContextManager(config=config)
+        assert ctx.context_window == 400_000
+        assert ctx.budget_source == TokenBudgetSource.EXPLICIT
 
 
 # ---------------------------------------------------------------------------
