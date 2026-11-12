@@ -26,10 +26,13 @@ logger = logging.getLogger(__name__)
 # that failed before its response started; nothing else retries one that died
 # mid-stream, and a failed call costs the agent loop a whole subsystem.
 STREAM_ATTEMPTS = 3
+SDK_RETRIES = 5
 # Error codes that mean the stream died, not that the request was wrong. A
 # gateway that cuts a stalled stream reports request_timeout, as a 400 or an
-# error event; the same request then usually finishes in seconds.
-_DEAD_STREAM_CODES = frozenset({"request_timeout", "server_error"})
+# error event; the same request then usually finishes in seconds. A Sub2API
+# gateway reports an upstream failure after the stream started as
+# response.failed with upstream_error.
+_DEAD_STREAM_CODES = frozenset({"request_timeout", "server_error", "upstream_error"})
 _REASONING_INCLUDE = "reasoning.encrypted_content"
 _sleep = time.sleep  # the backoff between stream attempts; tests replace it
 
@@ -87,10 +90,12 @@ def _client_kwargs(config: LLMConfig) -> dict:
         )
     # The SDK retries 408, 429, 5xx and dropped connections with exponential
     # backoff, and honours Retry-After. The agent loop bursts many calls in
-    # close succession and easily trips TPM caps on tight org tiers.
+    # close succession and easily trips TPM caps on tight org tiers. Its waits
+    # start at 0.5 s and double to 8 s: three retries gave up after ~3.5 s, far
+    # shorter than the 2/4/8 s (~14 s) stride-gpt waited before; five wait ~15 s.
     kwargs: dict = {
         "api_key": config.api_key or None,
-        "max_retries": 3,
+        "max_retries": SDK_RETRIES,
         "timeout": call_timeout(config),
     }
     if config.api_base:
@@ -341,7 +346,12 @@ def assistant_tool_turn(response: LLMResponse) -> dict:
             {
                 "id": tc.id,
                 "type": "function",
-                "function": {"name": tc.function_name, "arguments": _json.dumps(tc.arguments)},
+                "function": {
+                    "name": tc.function_name,
+                    "arguments": tc.raw_arguments
+                    if tc.parse_error and tc.raw_arguments is not None
+                    else _json.dumps(tc.arguments),
+                },
             }
             for tc in response.tool_calls or []
         ],
@@ -391,13 +401,15 @@ def _responses_tool_calls(response) -> list[ToolCallResult] | None:
     for item in getattr(response, "output", None) or []:
         if getattr(item, "type", None) != "function_call":
             continue
-        arguments, parse_error = _parse_tool_arguments(getattr(item, "arguments", None))
+        raw = getattr(item, "arguments", None)
+        arguments, parse_error = _parse_tool_arguments(raw)
         results.append(
             ToolCallResult(
                 id=getattr(item, "call_id", None) or getattr(item, "id", "") or "",
                 function_name=getattr(item, "name", "") or "",
                 arguments=arguments,
                 parse_error=parse_error,
+                raw_arguments=raw if isinstance(raw, str) else None,
             )
         )
     return results or None
@@ -470,15 +482,58 @@ def _call_responses(
     client = _openai_client(config)
     kwargs = _responses_call_kwargs(config, messages, tools)
     response = _stream_response(client, kwargs, call_timeout(config))
+    content = _responses_text(response)
+    incomplete_reason = _incomplete_reason(response)
+    tool_calls = _responses_tool_calls(response) if tools else None
+
+    refusal = _responses_refusal(response)
+    if refusal is not None and not content and not tool_calls:
+        # The answer is the refusal. Returned as empty content it would read as
+        # a blank reply and fail later as unparseable JSON, far from the cause.
+        raise ModelRefusalError(refusal)
+    if incomplete_reason == "content_filter":
+        raise ModelRefusalError("The response was stopped by the provider's content filter.")
+    if incomplete_reason is not None:
+        logger.warning(
+            "Model response is incomplete (%s); its content and tool calls are partial.",
+            incomplete_reason,
+        )
 
     return LLMResponse(
-        content=_responses_text(response),
+        content=content,
         thinking=_responses_thinking(response),
         model=config.model_name,
-        tool_calls=_responses_tool_calls(response) if tools else None,
+        tool_calls=tool_calls,
         reasoning_items=_responses_reasoning_items(response),
+        incomplete_reason=incomplete_reason,
         **_extract_usage(response),
     )
+
+
+class ModelRefusalError(Exception):
+    """The model declined to answer, or a content filter stopped the answer."""
+
+
+def _responses_refusal(response) -> str | None:
+    """The text of any refusal in the response's messages, or None."""
+    parts: list[str] = []
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        for block in getattr(item, "content", None) or []:
+            kind = block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+            if kind == "refusal":
+                text = block.get("refusal") if isinstance(block, dict) else getattr(block, "refusal", None)
+                parts.append(text or "")
+    return "\n".join(parts) if parts else None
+
+
+def _incomplete_reason(response) -> str | None:
+    """Why the response stopped early, or None when it completed."""
+    if getattr(response, "status", None) != "incomplete":
+        return None
+    details = getattr(response, "incomplete_details", None)
+    return getattr(details, "reason", None) or "unknown"
 
 
 def _stream_died(error: openai.APIError, *, opened: bool) -> bool:
@@ -522,6 +577,7 @@ def _read_stream(client: OpenAI, kwargs: dict, limit: float, opened: list[bool])
     stream = client.responses.create(**kwargs, stream=True)
     opened[0] = True
     request = stream.response.request
+    final = None
     with stream:
         for event in stream:
             if time.monotonic() - started > limit:
@@ -531,7 +587,13 @@ def _read_stream(client: OpenAI, kwargs: dict, limit: float, opened: list[bool])
             if error is not None:
                 raise error
             if getattr(event, "type", None) in ("response.completed", "response.incomplete"):
-                return event.response
+                # Read on to the end of the stream rather than closing it here:
+                # the server ends it right after this event, and a client that
+                # hangs up first makes a proxy in between record the call as
+                # failed (vega's llm-proxy: "context canceled", status 502).
+                final = event.response
+    if final is not None:
+        return final
     raise openai.APIError(
         "The model stream ended before the response completed.",
         request,

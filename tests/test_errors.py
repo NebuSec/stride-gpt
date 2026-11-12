@@ -162,3 +162,29 @@ class TestProviderMessage:
     def test_a_plain_text_error_keeps_its_text(self):
         exc = connection_error()
         assert classify_error(exc)[1] == "The provider failed to answer. (Connection error.)"
+
+
+class TestClassifyStreamedFailures:
+    """A failure inside a started stream carries a code, not an HTTP status."""
+
+    @pytest.mark.parametrize(
+        ("code", "expected"),
+        [
+            ("context_length_exceeded", "context_overflow"),
+            ("rate_limit_exceeded", "rate_limited"),
+            ("invalid_api_key", "auth"),
+            ("upstream_error", "provider_error"),
+        ],
+    )
+    def test_by_code(self, code, expected):
+        import httpx
+
+        exc = openai.APIError("boom", httpx.Request("POST", "http://x"), body={"code": code})
+        assert classify_error(exc)[0] == expected
+
+    def test_a_refusal(self):
+        from stride_gpt.core.llm import ModelRefusalError
+
+        error_class, reason = classify_error(ModelRefusalError("not this one"))
+        assert error_class == "provider_error"
+        assert "declined" in reason and "not this one" in reason

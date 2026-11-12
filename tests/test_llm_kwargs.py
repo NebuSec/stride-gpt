@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from stride_gpt.core import llm
 from stride_gpt.core.llm import (
     DEFAULT_CALL_TIMEOUT_SECONDS,
     _client_kwargs,
@@ -20,7 +21,7 @@ class TestClientKwargs:
         cfg = LLMConfig(provider="OpenAI API", model_name="gpt-6-sol", api_key="fake")
         kwargs = _client_kwargs(cfg)
         assert kwargs["api_key"] == "fake"
-        assert kwargs["max_retries"] == 3
+        assert kwargs["max_retries"] == llm.SDK_RETRIES
         assert "base_url" not in kwargs
 
     def test_custom_base_url_is_passed_through(self):
@@ -335,3 +336,19 @@ class TestSpecAlignment:
         instructions, items = messages_to_responses_input([{"role": "system", "content": "only"}])
         assert instructions is None
         assert items == [{"role": "system", "content": "only"}]
+
+
+class TestToolCallReplay:
+    def test_unparseable_arguments_are_replayed_as_sent(self):
+        response = LLMResponse(content="", tool_calls=[ToolCallResult(
+            id="c1", function_name="read_file", arguments={},
+            parse_error="arguments were not valid JSON", raw_arguments='{"path": "a.py')])
+        turn = assistant_tool_turn(response)
+        assert turn["tool_calls"][0]["function"]["arguments"] == '{"path": "a.py'
+
+    def test_parsed_arguments_are_replayed_as_json(self):
+        response = LLMResponse(content="", tool_calls=[ToolCallResult(
+            id="c1", function_name="read_file", arguments={"path": "a.py"},
+            raw_arguments='{ "path" : "a.py" }')])
+        turn = assistant_tool_turn(response)
+        assert turn["tool_calls"][0]["function"]["arguments"] == '{"path": "a.py"}'

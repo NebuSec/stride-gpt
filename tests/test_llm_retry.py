@@ -123,12 +123,12 @@ class TestRetries:
         assert len(calls) == 1
         assert sleeps == []
 
-    def test_gives_up_after_three_retries(self, monkeypatch, sleeps):
-        calls = _script(monkeypatch, [(429, {}) for _ in range(4)])
+    def test_gives_up_after_the_sdk_retries(self, monkeypatch, sleeps):
+        calls = _script(monkeypatch, [(429, {}) for _ in range(llm.SDK_RETRIES + 1)])
         with pytest.raises(openai.RateLimitError):
             call_llm(_config(), _MESSAGES)
-        assert len(calls) == 4
-        assert len(sleeps) == 3
+        assert len(calls) == llm.SDK_RETRIES + 1
+        assert len(sleeps) == llm.SDK_RETRIES
 
     def test_retry_after_header_sets_the_delay(self, monkeypatch, sleeps):
         _script(monkeypatch, [(429, {"retry-after": "17"}), _SUCCESS])
@@ -198,10 +198,11 @@ class TestStreams:
     def test_a_connection_error_before_the_stream_is_left_to_the_sdk(
         self, monkeypatch, sleeps, backoff
     ):
-        calls = _script(monkeypatch, [httpx.ConnectError("refused") for _ in range(4)])
+        tries = llm.SDK_RETRIES + 1
+        calls = _script(monkeypatch, [httpx.ConnectError("refused") for _ in range(tries)])
         with pytest.raises(openai.APIConnectionError):
             call_llm(_config(), _MESSAGES)
-        assert len(calls) == 4  # the SDK's 1 + 3, not multiplied here
+        assert len(calls) == tries  # the SDK's own attempts, not multiplied here
         assert backoff == []
 
     def test_a_stream_past_the_call_timeout_is_cut(self, monkeypatch, sleeps, backoff):
@@ -228,3 +229,59 @@ class TestReasoning:
         assert response.reasoning_items == [
             {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "opaque"}
         ]
+
+
+def _message(content: list[dict]) -> dict:
+    return {"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+            "content": content}
+
+
+class TestTerminalStates:
+    def test_the_stream_is_read_to_its_end(self, monkeypatch, sleeps):
+        """Hanging up at response.completed made the proxy record a failure."""
+        consumed = []
+
+        class Tracked(Stream):
+            def body(self):
+                yield from super().body()
+                consumed.append(True)
+
+        _script(monkeypatch, [Tracked(_CREATED, _COMPLETED)])
+        assert call_llm(_config(), _MESSAGES).content == "ok"
+        assert consumed == [True]
+
+    def test_an_incomplete_response_is_marked(self, monkeypatch, sleeps, caplog):
+        incomplete = {"type": "response.incomplete", "sequence_number": 1, "response": {
+            **_OK, "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"}}}
+        _script(monkeypatch, [Stream(_CREATED, incomplete)])
+        response = call_llm(_config(), _MESSAGES)
+        assert response.incomplete_reason == "max_output_tokens"
+        assert "incomplete" in caplog.text
+
+    def test_a_completed_response_is_not_marked(self, monkeypatch, sleeps):
+        _script(monkeypatch, [_SUCCESS])
+        assert call_llm(_config(), _MESSAGES).incomplete_reason is None
+
+    def test_a_content_filter_stop_is_raised(self, monkeypatch, sleeps):
+        incomplete = {"type": "response.incomplete", "sequence_number": 1, "response": {
+            **_OK, "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"}}}
+        _script(monkeypatch, [Stream(_CREATED, incomplete)])
+        with pytest.raises(llm.ModelRefusalError, match="content filter"):
+            call_llm(_config(), _MESSAGES)
+
+    def test_a_refusal_is_raised_not_returned_blank(self, monkeypatch, sleeps):
+        refused = {**_COMPLETED, "response": {**_OK, "output": [
+            _message([{"type": "refusal", "refusal": "I can't help with that."}])]}}
+        _script(monkeypatch, [Stream(refused)])
+        with pytest.raises(llm.ModelRefusalError, match="can't help"):
+            call_llm(_config(), _MESSAGES)
+
+    def test_a_gateway_upstream_failure_mid_stream_is_retried(self, monkeypatch, sleeps, backoff):
+        failed = {"type": "response.failed", "sequence_number": 1, "response": {
+            **_OK, "status": "failed", "output": [],
+            "error": {"code": "upstream_error", "message": "Upstream request failed"}}}
+        calls = _script(monkeypatch, [Stream(_CREATED, failed), _SUCCESS])
+        assert call_llm(_config(), _MESSAGES).content == "ok"
+        assert len(calls) == 2
