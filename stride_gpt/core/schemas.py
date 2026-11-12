@@ -41,6 +41,9 @@ class ToolCallResult:
     # Set when the model's arguments couldn't be parsed into a JSON object.
     # ``arguments`` is then ``{}`` and the call must not be executed.
     parse_error: str | None = None
+    # The arguments exactly as the model sent them, replayed in the history so
+    # the model sees the call it made (not ``{}``) next to the parse error.
+    raw_arguments: str | None = None
 
 
 @dataclass
@@ -54,6 +57,9 @@ class LLMResponse:
     # The response's reasoning items, with their encrypted content, for the
     # next request of the same conversation (requests are not stored).
     reasoning_items: list[dict[str, Any]] | None = None
+    # Why the response stopped early ("max_output_tokens", ...), or None when
+    # it completed. The content and tool calls are then partial.
+    incomplete_reason: str | None = None
     tool_calls: list[ToolCallResult] | None = None
     # Usage the provider reported for this call. ``None`` means the provider
     # didn't report it — kept distinct from ``0`` so callers never mistake

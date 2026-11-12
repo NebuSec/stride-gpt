@@ -16,6 +16,7 @@ from typing import Any
 
 import openai
 
+from stride_gpt.core.llm import ModelRefusalError
 from stride_gpt.core.schemas import ErrorClass
 
 _CONTEXT_OVERFLOW_MARKERS = (
@@ -51,6 +52,24 @@ def _by_type(exc: BaseException) -> ErrorClass | None:
     if isinstance(exc, openai.AuthenticationError | openai.PermissionDeniedError):
         return "auth"
     return None
+
+
+# Codes a Responses stream reports in an `error` or `response.failed` event,
+# which carries no HTTP status: the stream had already started with a 200.
+_CODE_CLASSES: dict[str, ErrorClass] = {
+    "context_length_exceeded": "context_overflow",
+    "rate_limit_exceeded": "rate_limited",
+    "insufficient_quota": "rate_limited",
+    "invalid_api_key": "auth",
+    "authentication_failed": "auth",
+    "permission_denied": "auth",
+}
+
+
+def _by_code(exc: BaseException) -> ErrorClass | None:
+    """Map the error code a streamed failure carries to an error class."""
+    code = getattr(exc, "code", None)
+    return _CODE_CLASSES.get(code) if isinstance(code, str) else None
 
 
 def _by_provider_error(exc: BaseException) -> ErrorClass | None:
@@ -114,9 +133,12 @@ def classify_error(exc: BaseException) -> tuple[ErrorClass, str]:
     """Return the error class for ``exc`` and the reason to show the user."""
     err_str = str(exc)
 
+    if isinstance(exc, ModelRefusalError):
+        return "provider_error", f"The model declined to answer: {err_str}"
+
     # Status before the generic provider check: a status on a wrapped exception
     # is more specific than "some API error".
-    error_class = _by_type(exc) or _by_status(exc) or _by_provider_error(exc)
+    error_class = _by_type(exc) or _by_status(exc) or _by_code(exc) or _by_provider_error(exc)
 
     # llama.cpp says "n_keep"/"n_ctx" when the prompt won't fit. That arrives as
     # a plain string, or wrapped in a generic SDK exception with whatever
