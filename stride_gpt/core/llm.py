@@ -112,11 +112,16 @@ def _openai_client(config: LLMConfig) -> OpenAI:
 def _responses_text_format(config: LLMConfig) -> dict | None:
     """Responses API `text.format` payload, or None to omit."""
     if isinstance(config.response_format, dict):
+        # strict is sent as False on purpose. Left out, the API now treats it as
+        # True, and strict mode requires `additionalProperties: false` on every
+        # object, which a Pydantic model_json_schema() does not carry: the
+        # planner's AnalysisPlan request is refused as an invalid schema.
         return {
             "format": {
                 "type": "json_schema",
                 "name": "response",
                 "schema": config.response_format,
+                "strict": False,
             }
         }
     if config.response_format == "json":

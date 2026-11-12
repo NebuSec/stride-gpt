@@ -60,6 +60,21 @@ class TestResponsesCallKwargs:
         kwargs = _responses_call_kwargs(cfg, [{"role": "user", "content": "hi"}])
         assert kwargs["text"] == {"format": {"type": "json_object"}}
 
+    def test_json_schema_is_sent_non_strict(self):
+        """Strict mode needs additionalProperties: false on every object, which
+        a Pydantic schema lacks; left unset, strict now defaults to True."""
+        from stride_gpt.core.schemas import AnalysisPlan
+
+        cfg = LLMConfig(
+            provider="OpenAI API",
+            model_name="gpt-6-sol",
+            api_key="fake",
+            response_format=AnalysisPlan.model_json_schema(),
+        )
+        kwargs = _responses_call_kwargs(cfg, [{"role": "user", "content": "hi"}])
+        assert kwargs["text"]["format"]["type"] == "json_schema"
+        assert kwargs["text"]["format"]["strict"] is False
+
     def test_tools_skip_json_format(self):
         cfg = LLMConfig(
             provider="OpenAI API",
