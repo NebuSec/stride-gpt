@@ -34,14 +34,17 @@ _REASONING_INCLUDE = "reasoning.encrypted_content"
 _sleep = time.sleep  # the backoff between stream attempts; tests replace it
 
 
-def _default_output_tokens(config: LLMConfig, fallback: int) -> int:
-    """Resolve the output-token cap: caller override > registry default > fallback."""
+def _output_token_cap(config: LLMConfig) -> int | None:
+    """``max_output_tokens`` for a call, or None to leave the model's own limit.
+
+    A model the registry doesn't know (a gateway route, a newer model) gets no
+    cap, as it did before this fork replaced LiteLLM: a guessed one cut long
+    answers short, and an incomplete answer reads like a finished one.
+    """
     if config.max_tokens:
         return config.max_tokens
     registered = get_model(config.provider, config.model_name)
-    if registered is not None:
-        return registered.default_tokens
-    return fallback
+    return registered.default_tokens if registered is not None else None
 
 
 def call_llm(config: LLMConfig, messages: list[dict]) -> LLMResponse:
@@ -141,6 +144,10 @@ def _to_responses_tools(tools: list[dict]) -> list[dict]:
                     "name": fn.get("name", ""),
                     "description": fn.get("description", ""),
                     "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+                    # A required field. Left out, the API applies strict mode,
+                    # which these schemas (no additionalProperties: false) are
+                    # not written for.
+                    "strict": bool(fn.get("strict", False)),
                 }
             )
         else:
@@ -163,7 +170,9 @@ def _convert_content_parts(content: object) -> object:
         elif ptype == "image_url":
             image = part.get("image_url")
             url = image.get("url") if isinstance(image, dict) else image
-            converted.append({"type": "input_image", "image_url": url})
+            detail = (image.get("detail") if isinstance(image, dict) else None) or "auto"
+            # detail is a required field of input_image.
+            converted.append({"type": "input_image", "image_url": url, "detail": detail})
         else:
             converted.append(part)
     return converted
@@ -178,15 +187,19 @@ def messages_to_responses_input(messages: list[dict]) -> tuple[str | None, list[
     """
     instructions_parts: list[str] = []
     items: list[dict] = []
+    leading = True
 
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content")
 
-        if role == "system":
-            if isinstance(content, str) and content:
+        # Only the system messages that open the conversation are its
+        # instructions; one that arrives later stays where it was said.
+        if role == "system" and leading and isinstance(content, str):
+            if content:
                 instructions_parts.append(content)
             continue
+        leading = False
 
         if role == "tool":
             items.append(
@@ -224,6 +237,11 @@ def messages_to_responses_input(messages: list[dict]) -> tuple[str | None, list[
         items.append(item)
 
     instructions = "\n\n".join(instructions_parts) or None
+    if not items and instructions:
+        # The API refuses an empty input: a system-only request is sent as
+        # input instead of instructions.
+        items = [{"role": "system", "content": instructions}]
+        instructions = None
     return instructions, items
 
 
@@ -250,8 +268,10 @@ def _responses_call_kwargs(
         "model": config.model_name,
         "input": input_items,
         "store": False,
-        "max_output_tokens": _default_output_tokens(config, 20000),
     }
+    cap = _output_token_cap(config)
+    if cap is not None:
+        kwargs["max_output_tokens"] = cap
     if instructions:
         kwargs["instructions"] = instructions
     if _keeps_reasoning(config):
@@ -290,9 +310,20 @@ def _responses_reasoning_items(response) -> list[dict] | None:
     for item in getattr(response, "output", None) or []:
         if getattr(item, "type", None) != "reasoning":
             continue
-        payload = item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else dict(item)
-        # Output-only field: the API refuses it on an input item.
-        payload.pop("status", None)
+        raw = item.model_dump() if hasattr(item, "model_dump") else dict(item)
+        # The input item needs id, type and summary (empty is fine) and carries
+        # the encrypted content back; nothing else of the output is replayed.
+        payload: dict = {
+            "type": "reasoning",
+            "id": raw.get("id") or "",
+            "summary": [
+                {"type": s.get("type") or "summary_text", "text": s.get("text") or ""}
+                for s in raw.get("summary") or []
+                if isinstance(s, dict)
+            ],
+        }
+        if raw.get("encrypted_content"):
+            payload["encrypted_content"] = raw["encrypted_content"]
         items.append(payload)
     return items or None
 
