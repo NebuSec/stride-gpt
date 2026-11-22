@@ -159,6 +159,8 @@ Models are registered in `stride_gpt/models.py` with provider, default tokens, m
 
 - **Responses must set `store=False`.** Default storage would persist threat-model prompts (including source) on OpenAI's side.
 - **GPT-5 and later use `max_output_tokens` on Responses.** Driven off `_default_output_tokens` and the model registry.
+- **Reasoning effort is opt-in.** `LLMConfig.reasoning_effort` (`--worker-reasoning-effort` / `--architect-reasoning-effort`) is sent as `reasoning.effort`; unset sends no `reasoning` parameter and the model keeps its own default.
+  It joins the checkpoint `config_hash` only when set, so older checkpoints still resume.
 - **Every call streams** (`_stream_response`), and the call ends on `response.completed` (or `response.incomplete`).
   A non-streamed answer sends no response headers until it is complete, and a gateway with a response-header timeout fails a slow answer from a working model.
 - **Retries before a response starts belong to the SDK** (`max_retries` in `_client_kwargs`): 408, 429, 5xx and dropped connections, honouring `Retry-After`.

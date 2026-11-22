@@ -45,6 +45,11 @@ class TestComputeCheckpointConfigHash:
         b = compute_checkpoint_config_hash(_pair("claude-opus-4-7"))
         assert a != b
 
+    def test_changes_with_reasoning_effort(self):
+        base = _pair()
+        high = ModelPair(worker=base.worker.model_copy(update={"reasoning_effort": "high"}))
+        assert compute_checkpoint_config_hash(base) != compute_checkpoint_config_hash(high)
+
     def test_ignores_api_key(self):
         a = compute_checkpoint_config_hash(_pair(api_key="key-A"))
         b = compute_checkpoint_config_hash(_pair(api_key="key-B"))
