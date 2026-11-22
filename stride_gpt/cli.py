@@ -111,6 +111,16 @@ class OutputFormat(StrEnum):
     html = "html"
 
 
+class ReasoningEffortOption(StrEnum):
+    """Responses `reasoning.effort`; see LLMConfig.reasoning_effort."""
+    none = "none"
+    minimal = "minimal"
+    low = "low"
+    medium = "medium"
+    high = "high"
+    xhigh = "xhigh"
+
+
 class AppTypeOverride(StrEnum):
     """Override for the planner's detected app type. `auto` keeps the planner's choice."""
     auto = "auto"
@@ -1043,6 +1053,8 @@ def analyze(
     worker_context_window: Annotated[int | None, typer.Option(min=1, help="Worker context window in tokens. Needed when the model id names a gateway route the model registry can't know; otherwise looked up.")] = None,
     architect_context_window: Annotated[int | None, typer.Option(min=1, help="Architect context window in tokens; see --worker-context-window.")] = None,
     call_timeout: Annotated[int | None, typer.Option(min=1, help=f"Seconds one model call may take, whole stream included (default {DEFAULT_CALL_TIMEOUT_SECONDS}).")] = None,
+    worker_reasoning_effort: Annotated[ReasoningEffortOption | None, typer.Option(help="Worker reasoning effort (Responses reasoning.effort). Unset leaves the model's default.")] = None,
+    architect_reasoning_effort: Annotated[ReasoningEffortOption | None, typer.Option(help="Architect reasoning effort; see --worker-reasoning-effort.")] = None,
     output: Annotated[Path | None, typer.Option("-o", "--output", help="Output file path.")] = None,
     output_format: Annotated[OutputFormat, typer.Option("-f", "--format", help="Output format.")] = OutputFormat.markdown,
     max_llm_calls: Annotated[int, typer.Option(help="Max LLM calls per subsystem; a subsystem that hits it gets one final round to report what it found, so none is skipped. The default is about twice the ~12 rounds per subsystem a measured full run took (0 = unlimited).")] = DEFAULT_MAX_LLM_CALLS,
@@ -1073,6 +1085,8 @@ def analyze(
         worker_context_window=worker_context_window,
         architect_context_window=architect_context_window,
         call_timeout=call_timeout,
+        worker_reasoning_effort=worker_reasoning_effort,
+        architect_reasoning_effort=architect_reasoning_effort,
     )
 
     target = path.resolve()
@@ -1223,6 +1237,8 @@ def quick(
     architect_api_base: Annotated[str | None, typer.Option(help="Architect API base URL (a Responses-compatible endpoint).")] = None,
     architect_max_tokens: Annotated[int | None, typer.Option(help="Architect per-call output token cap.")] = None,
     no_architect: Annotated[bool, typer.Option("--no-architect", help="Bypass any saved architect tier for this run; worker handles every call.")] = False,
+    worker_reasoning_effort: Annotated[ReasoningEffortOption | None, typer.Option(help="Worker reasoning effort (Responses reasoning.effort). Unset leaves the model's default.")] = None,
+    architect_reasoning_effort: Annotated[ReasoningEffortOption | None, typer.Option(help="Architect reasoning effort; see --worker-reasoning-effort.")] = None,
     input_file: Annotated[Path | None, typer.Option("-i", "--input", help="App description file.")] = None,
     app_type: Annotated[str | None, typer.Option(help="Optional hint about the application type (Web / Generative AI / Agentic AI application). Leave unset to let the agent decide which reference cards to load.")] = None,
     output: Annotated[Path | None, typer.Option("-o", "--output", help="Output file path.")] = None,
@@ -1251,6 +1267,8 @@ def quick(
         architect_api_base=architect_api_base,
         architect_max_tokens=architect_max_tokens,
         no_architect=no_architect,
+        worker_reasoning_effort=worker_reasoning_effort,
+        architect_reasoning_effort=architect_reasoning_effort,
     )
 
     if input_file:
@@ -1447,6 +1465,8 @@ def _build_model_pair(
     worker_context_window: int | None = None,
     architect_context_window: int | None = None,
     call_timeout: int | None = None,
+    worker_reasoning_effort: str | None = None,
+    architect_reasoning_effort: str | None = None,
 ):
     """Build a ModelPair from CLI flags, falling back to saved config + env vars.
 
@@ -1462,7 +1482,7 @@ def _build_model_pair(
 
     architect_flag_set = any([
         architect_model, architect_api_key, architect_api_base, architect_max_tokens,
-        architect_context_window,
+        architect_context_window, architect_reasoning_effort,
     ])
     if architect_flag_set and not architect_model:
         console.print("[red]--architect-* flags require --architect-model.[/red]")
@@ -1503,6 +1523,7 @@ def _build_model_pair(
         max_tokens=worker_max_tokens,
         timeout=call_timeout,
         context_window=worker_context_window,
+        reasoning_effort=_effort(worker_reasoning_effort),
     )
 
     # ---- Architect tier ----
@@ -1526,6 +1547,7 @@ def _build_model_pair(
             max_tokens=architect_max_tokens,
             timeout=call_timeout,
             context_window=architect_context_window,
+            reasoning_effort=_effort(architect_reasoning_effort),
         )
     elif saved and saved.get("architect_model"):
         architect = _tier_to_llm_config_from_saved(saved, "architect")
@@ -1541,6 +1563,11 @@ def _build_model_pair(
             raise typer.Exit(1)
 
     return ModelPair(worker=worker, architect=architect)
+
+
+def _effort(value: str | None) -> str | None:
+    """A ReasoningEffortOption (or plain string) as LLMConfig's literal."""
+    return str(value) if value else None
 
 
 def _tier_to_llm_config_from_saved(saved: dict, tier: str):

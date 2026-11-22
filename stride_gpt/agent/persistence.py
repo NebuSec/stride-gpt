@@ -290,12 +290,17 @@ def _model_fingerprint(config: LLMConfig) -> dict[str, Any]:
     against the same model are functionally identical and should share a
     ``config_hash``.
     """
-    return {
+    fingerprint: dict[str, Any] = {
         "provider": config.provider,
         "model_name": config.model_name,
         "max_tokens": config.max_tokens,
         "response_format": config.response_format,
     }
+    # Only when set, so a checkpoint written before the field existed still
+    # matches a run that leaves the effort at the model's default.
+    if config.reasoning_effort:
+        fingerprint["reasoning_effort"] = config.reasoning_effort
+    return fingerprint
 
 
 def compute_config_hash(

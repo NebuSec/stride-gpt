@@ -12,6 +12,10 @@ from pydantic import BaseModel
 # run (a common one cuts streams at 15).
 DEFAULT_CALL_TIMEOUT_SECONDS = 1200
 
+# The Responses API's `reasoning.effort` values. Which of them a model accepts
+# is the model's (or the gateway's) business, so none is refused here.
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
+
 
 class LLMConfig(BaseModel):
     """Configuration for an LLM call. Constructed by UI layer from session state."""
@@ -28,6 +32,9 @@ class LLMConfig(BaseModel):
     # name can know the window; None means look it up (agent/context.py).
     context_window: int | None = None
     max_tokens: int | None = None  # Override default max tokens
+    # How hard the model thinks (Responses `reasoning.effort`). None sends no
+    # `reasoning` parameter, which leaves the model's own default.
+    reasoning_effort: ReasoningEffort | None = None
     response_format: str | dict = "text"  # "text", "json", or a JSON schema dict
 
 

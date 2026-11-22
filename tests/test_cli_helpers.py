@@ -123,6 +123,33 @@ class TestBuildModelPair:
         assert (pair.worker.context_window, pair.worker.timeout) == (272_000, 900)
         assert (pair.architect.context_window, pair.architect.timeout) == (400_000, 900)
 
+    def test_reasoning_effort_reaches_each_tier(self, monkeypatch):
+        monkeypatch.setattr(cli, "load_config", lambda: None)
+        pair = cli._build_model_pair(
+            worker_model="openai/route-a",
+            worker_api_key="k",
+            architect_model="openai/route-b",
+            architect_api_key="k",
+            worker_reasoning_effort=cli.ReasoningEffortOption.high,
+            architect_reasoning_effort=cli.ReasoningEffortOption.xhigh,
+        )
+        assert pair.worker.reasoning_effort == "high"
+        assert pair.architect.reasoning_effort == "xhigh"
+
+    def test_reasoning_effort_defaults_to_the_models_own(self, monkeypatch):
+        monkeypatch.setattr(cli, "load_config", lambda: None)
+        pair = cli._build_model_pair(worker_model="openai/gpt-x", worker_api_key="k")
+        assert pair.worker.reasoning_effort is None
+
+    def test_architect_reasoning_effort_without_model_exits_2(self, monkeypatch):
+        monkeypatch.setattr(cli, "load_config", lambda: None)
+        with pytest.raises(typer.Exit) as exc:
+            cli._build_model_pair(
+                worker_model="openai/gpt-x", worker_api_key="k",
+                architect_reasoning_effort=cli.ReasoningEffortOption.high,
+            )
+        assert exc.value.exit_code == 2
+
     def test_architect_context_window_without_model_exits_2(self, monkeypatch):
         monkeypatch.setattr(cli, "load_config", lambda: None)
         with pytest.raises(typer.Exit) as exc:

@@ -253,6 +253,23 @@ class TestReasoningReplay:
         kwargs = _responses_call_kwargs(config, [{"role": "user", "content": "hi"}])
         assert kwargs["include"] == ["reasoning.encrypted_content"]
 
+    def test_reasoning_effort_is_sent_when_set(self):
+        config = LLMConfig(
+            provider="OpenAI API", model_name="some-gateway-route", api_key="k",
+            reasoning_effort="xhigh",
+        )
+        kwargs = _responses_call_kwargs(config, [{"role": "user", "content": "hi"}])
+        assert kwargs["reasoning"] == {"effort": "xhigh"}
+
+    def test_no_reasoning_parameter_without_an_effort(self):
+        config = LLMConfig(provider="OpenAI API", model_name="gpt-6-sol", api_key="k")
+        kwargs = _responses_call_kwargs(config, [{"role": "user", "content": "hi"}])
+        assert "reasoning" not in kwargs
+
+    def test_an_unknown_effort_is_refused(self):
+        with pytest.raises(ValueError):
+            LLMConfig(provider="OpenAI API", model_name="m", api_key="k", reasoning_effort="max")
+
     def test_an_unknown_route_asks_too(self):
         config = LLMConfig(provider="OpenAI API", model_name="some-gateway-route", api_key="k")
         kwargs = _responses_call_kwargs(config, [{"role": "user", "content": "hi"}])

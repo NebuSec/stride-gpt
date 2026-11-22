@@ -279,6 +279,8 @@ def _responses_call_kwargs(
         kwargs["max_output_tokens"] = cap
     if instructions:
         kwargs["instructions"] = instructions
+    if config.reasoning_effort:
+        kwargs["reasoning"] = {"effort": config.reasoning_effort}
     if _keeps_reasoning(config):
         # store=False keeps nothing server-side, so the model's reasoning only
         # carries into the next request if it comes back encrypted and is sent
