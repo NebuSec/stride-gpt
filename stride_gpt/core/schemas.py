@@ -14,7 +14,7 @@ DEFAULT_CALL_TIMEOUT_SECONDS = 1200
 
 # The Responses API's `reasoning.effort` values. Which of them a model accepts
 # is the model's (or the gateway's) business, so none is refused here.
-ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 
 class LLMConfig(BaseModel):

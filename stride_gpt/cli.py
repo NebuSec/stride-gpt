@@ -119,6 +119,7 @@ class ReasoningEffortOption(StrEnum):
     medium = "medium"
     high = "high"
     xhigh = "xhigh"
+    max = "max"
 
 
 class AppTypeOverride(StrEnum):

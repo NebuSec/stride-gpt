@@ -268,7 +268,7 @@ class TestReasoningReplay:
 
     def test_an_unknown_effort_is_refused(self):
         with pytest.raises(ValueError):
-            LLMConfig(provider="OpenAI API", model_name="m", api_key="k", reasoning_effort="max")
+            LLMConfig(provider="OpenAI API", model_name="m", api_key="k", reasoning_effort="ultra")
 
     def test_an_unknown_route_asks_too(self):
         config = LLMConfig(provider="OpenAI API", model_name="some-gateway-route", api_key="k")
