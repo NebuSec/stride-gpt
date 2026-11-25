@@ -992,3 +992,69 @@ class TestCoverageGaps:
             if isinstance(b, dict) and b.get("type") == "image"
         )
         assert image["source"] == {"type": "base64", "media_type": "image/png", "data": "AAAA"}
+
+
+class TestFourthReview:
+    def _printed(self, exc) -> list[str]:
+        import io
+
+        from rich.console import Console
+
+        from stride_gpt import cli
+
+        buffer = io.StringIO()
+        original = cli.console
+        cli.console = Console(file=buffer, width=80)
+        try:
+            assert cli._report_provider_failure(exc)
+        finally:
+            cli.console = original
+        return [line for line in buffer.getvalue().splitlines() if line.strip()]
+
+    def _status_error(self, status: int, body: dict):
+        response = httpx2.Response(status, request=httpx2.Request("POST", "http://p/v1/messages"))
+        cls = {403: anthropic.PermissionDeniedError, 502: anthropic.InternalServerError}[status]
+        return cls("x", response=response, body=body)
+
+    def test_brackets_in_a_providers_body_are_printed_not_parsed(self):
+        lines = self._printed(self._status_error(502, {"detail": "bad gateway [/v1/messages] [cost_cap]"}))
+        assert "[/v1/messages] [cost_cap]" in lines[0]
+
+    def test_a_multi_line_body_prints_as_one_line(self):
+        lines = self._printed(
+            self._status_error(403, {"detail": "insufficient balance\nscan cost cap exceeded"})
+        )
+        assert len(lines) == 1
+        assert "(HTTP 403: insufficient balance scan cost cap exceeded)" in lines[0]
+
+    def test_a_synthesis_failure_reason_does_not_wrap(self):
+        import io
+
+        from rich.console import Console
+
+        from stride_gpt.agent.progress import RichProgress
+
+        buffer = io.StringIO()
+        RichProgress(Console(file=buffer, width=80)).synthesis_failed("x " * 100)
+        assert len([line for line in buffer.getvalue().splitlines() if line.strip()]) == 2
+
+    def test_thinking_left_last_by_a_dropped_empty_text_is_not_replayed(self, monkeypatch, no_sleep):
+        blocks = [_TOOL_USE, _THINKING, {"type": "text", "text": ""}]
+        _serve(monkeypatch, [_message_events(*blocks, stop_reason="max_tokens")])
+        history = [{"role": "user", "content": "go"}]
+        history.append(assistant_tool_turn(call_llm_with_tools(_config(), history, _TOOLS)))
+        history.append({"role": "tool", "tool_call_id": "toolu_1", "content": "cut"})
+        kwargs = messages_call_kwargs(_config(), history, _TOOLS)
+        assert all(b["type"] != "thinking" for b in kwargs["messages"][1]["content"])
+
+    def test_the_planners_schema_becomes_a_structured_output(self):
+        from stride_gpt.core.schemas import AnalysisPlan
+
+        kwargs = messages_call_kwargs(
+            _config(response_format=AnalysisPlan.model_json_schema()),
+            [{"role": "user", "content": "plan"}],
+        )
+        schema = kwargs["output_config"]["format"]["schema"]
+        assert schema["additionalProperties"] is False
+        assert all(d.get("additionalProperties") is False for d in schema.get("$defs", {}).values()
+                   if d.get("type") == "object")

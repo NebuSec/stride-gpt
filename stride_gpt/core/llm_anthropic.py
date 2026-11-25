@@ -483,8 +483,9 @@ def _has_unreplayable_thinking(message) -> bool:
             return True
         if kind == "redacted_thinking" and not getattr(block, "data", None):
             return True
-    replayed = [b for b in blocks if getattr(b, "type", None) in _REPLAY_FIELDS]
-    return bool(replayed) and getattr(replayed[-1], "type", None) in ("thinking", "redacted_thinking")
+    # Judged on what would be replayed: empty text blocks are dropped there.
+    replayed = _replay_content(message)
+    return bool(replayed) and replayed[-1]["type"] in ("thinking", "redacted_thinking")
 
 
 def _has_unreplayable_call(message) -> bool:
@@ -598,8 +599,10 @@ def _stream_died(error: anthropic.APIError, *, opened: bool) -> bool:
 
 def _read_stream(stream_fn, kwargs: dict, limit: float, opened: list[bool]):
     """One streamed call: its final Message, or the error that ended it."""
-    started = time.monotonic()
     with stream_fn(**kwargs) as stream:
+        # From the open: the SDK's own retries before it (their backoff and
+        # Retry-After) are not part of this stream's time.
+        started = time.monotonic()
         opened[0] = True
         request = stream.response.request
         try:

@@ -382,10 +382,14 @@ def _report_provider_failure(exc: Exception) -> bool:
     # wraps at 80 columns when stdout is not a terminal, and a caller reading
     # this output (vega's runner) classifies the failure line by line.
     if error_class == "auth":
-        console.print(f"[red]Authentication failed. {reason}[/red]", soft_wrap=True)
+        # escape: the reason quotes the provider's body, and "[...]" in it is
+        # not markup (an unmatched "[/v1/messages]" would raise).
+        console.print(f"[red]Authentication failed. {escape(reason)}[/red]", soft_wrap=True)
         return True
     if error_class in ("provider_error", "rate_limited"):
-        console.print(f"[red]The provider call failed after retries. {reason}[/red]", soft_wrap=True)
+        console.print(
+            f"[red]The provider call failed after retries. {escape(reason)}[/red]", soft_wrap=True
+        )
         console.print(
             "Check the API base URL, your network connection and the provider's status.",
             soft_wrap=True,
@@ -1568,7 +1572,8 @@ def _build_model_pair(
             architect_provider = saved.get("architect_provider", "")
             console.print(
                 f"[red]Saved architect tier ({architect_provider}/{saved['architect_model']}) "
-                f"could not be built — API key missing. Set the env var or pass --no-architect.[/red]"
+                f"could not be built — API key missing. Set the env var or pass --no-architect.[/red]",
+                soft_wrap=True,
             )
             raise typer.Exit(1)
 
@@ -1592,7 +1597,7 @@ def _check_effort(config) -> None:
 
     problem = effort_problem(config.reasoning_effort)
     if problem:
-        console.print(f"[red]{config.model_name}: {problem}[/red]", soft_wrap=True)
+        console.print(f"[red]{escape(config.model_name)}: {escape(problem)}[/red]", soft_wrap=True)
         raise typer.Exit(2)
 
 

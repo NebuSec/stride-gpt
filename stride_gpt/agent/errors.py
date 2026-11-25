@@ -169,7 +169,9 @@ def provider_message(exc: BaseException) -> str:
         text = _STATUS_PREFIX.sub("", str(exc), count=1)
         with contextlib.suppress(ValueError):
             text = _message_from(json.loads(text)) or text
-    return _REQUEST_ID.sub("", text).strip()
+    # One line: a body may carry newlines (an HTML error page), and the CLI
+    # prints each failure as a single line for a caller that reads by line.
+    return " ".join(_REQUEST_ID.sub("", text).split())
 
 
 def _http_status(exc: BaseException) -> int | None:
