@@ -35,7 +35,7 @@ def test_analyze_with_bad_key_prints_auth_failure(tmp_path):
         ])
     assert result.exit_code == 1
     assert "Authentication failed" in result.stdout
-    assert "(invalid x-api-key)" in result.stdout
+    assert "(HTTP 401: invalid x-api-key)" in result.stdout
     assert "AnthropicException" not in result.stdout
     assert "Traceback" not in result.stdout
 
@@ -50,7 +50,7 @@ def test_quick_with_bad_key_prints_auth_failure(tmp_path):
         ])
     assert result.exit_code == 1
     assert "Authentication failed" in result.stdout
-    assert "(invalid x-api-key)" in result.stdout
+    assert "(HTTP 401: invalid x-api-key)" in result.stdout
     assert "AnthropicException" not in result.stdout
     assert "Traceback" not in result.stdout
 

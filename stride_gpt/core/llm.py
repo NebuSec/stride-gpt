@@ -1,6 +1,9 @@
-"""Unified LLM interface: the OpenAI SDK against the Responses API.
+"""Unified LLM interface over two wire protocols.
 
-Agent history stays in Chat Completions shape and is converted at this boundary.
+A provider's registry entry (``ProviderInfo.api``) picks the protocol: the
+OpenAI SDK against the Responses API (this module), or the Anthropic SDK
+against the Messages API (``core/llm_anthropic.py``). Agent history stays in
+Chat Completions shape and is converted at this boundary.
 """
 
 from __future__ import annotations
@@ -52,14 +55,14 @@ def _output_token_cap(config: LLMConfig) -> int | None:
 
 def call_llm(config: LLMConfig, messages: list[dict]) -> LLMResponse:
     """Call an LLM with the given messages."""
-    return _call_responses(config, messages)
+    return _call(config, messages)
 
 
 def call_llm_with_tools(
     config: LLMConfig, messages: list[dict], tools: list[dict]
 ) -> LLMResponse:
     """Call an LLM with tool definitions. Returns response with optional tool_calls."""
-    return _call_responses(config, messages, tools=tools)
+    return _call(config, messages, tools=tools)
 
 
 def call_llm_with_image(
@@ -69,7 +72,22 @@ def call_llm_with_image(
     media_type: str = "image/jpeg",
 ) -> LLMResponse:
     """Call an LLM with an image for analysis."""
-    return _call_responses(config, _image_messages(config, prompt, base64_image, media_type))
+    return _call(config, _image_messages(config, prompt, base64_image, media_type))
+
+
+def _call(
+    config: LLMConfig,
+    messages: list[dict],
+    tools: list[dict] | None = None,
+) -> LLMResponse:
+    """Route a call to the protocol its provider speaks."""
+    provider = get_provider_by_key(config.provider)
+    if provider is not None and provider.api == "messages":
+        # Imported here: llm_anthropic imports this module's shared helpers.
+        from stride_gpt.core import llm_anthropic
+
+        return llm_anthropic.call_messages(config, messages, tools)
+    return _call_responses(config, messages, tools)
 
 
 # ---------------------------------------------------------------------------
@@ -78,15 +96,15 @@ def call_llm_with_image(
 
 
 def _client_kwargs(config: LLMConfig) -> dict:
-    """Kwargs for OpenAI() -- api_key, base_url, retries, timeout.
+    """Kwargs for OpenAI() or Anthropic() -- api_key, base_url, retries, timeout.
 
     A saved config can still name a provider this build dropped. Refuse it here
     rather than send that request, and possibly that key, to the wrong service.
     """
     if get_provider_by_key(config.provider) is None:
         raise ValueError(
-            f"Unsupported provider {config.provider!r}: only OpenAI is available. "
-            "Run /config to choose an OpenAI model."
+            f"Unsupported provider {config.provider!r}: only OpenAI and Anthropic are "
+            "available. Run /config to choose a model."
         )
     # The SDK retries 408, 429, 5xx and dropped connections with exponential
     # backoff, and honours Retry-After. The agent loop bursts many calls in
@@ -220,7 +238,13 @@ def messages_to_responses_input(messages: list[dict]) -> tuple[str | None, list[
             # The reasoning behind these calls goes back before them, as the
             # model produced it: without it the model starts every round of a
             # tool loop with no memory of why it made its previous calls.
-            items.extend(msg.get("reasoning_items") or [])
+            # Only Responses reasoning items: a conversation that another
+            # protocol's model took part in carries items this API can't read.
+            items.extend(
+                item
+                for item in msg.get("reasoning_items") or []
+                if isinstance(item, dict) and item.get("type") == "reasoning"
+            )
             if isinstance(content, str) and content:
                 items.append({"role": "assistant", "content": content})
             for tc in msg["tool_calls"]:

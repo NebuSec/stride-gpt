@@ -12,18 +12,20 @@ from pydantic import BaseModel
 # run (a common one cuts streams at 15).
 DEFAULT_CALL_TIMEOUT_SECONDS = 1200
 
-# The Responses API's `reasoning.effort` values. Which of them a model accepts
-# is the model's (or the gateway's) business, so none is refused here.
+# The Responses API's `reasoning.effort` values; the Messages API's
+# `output_config.effort` takes low to max (core/llm_anthropic.py refuses the
+# rest). Which of them a model accepts is otherwise the model's (or the
+# gateway's) business, so none is refused here.
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 
 class LLMConfig(BaseModel):
     """Configuration for an LLM call. Constructed by UI layer from session state."""
 
-    provider: str  # "OpenAI API"
+    provider: str  # "OpenAI API" or "Anthropic API"
     model_name: str  # bare name e.g. "gpt-6-sol"
     api_key: str  # BYOK key, passed per-call
-    api_base: str | None = None  # Custom Responses-compatible endpoint
+    api_base: str | None = None  # Custom Responses- or Messages-compatible endpoint
     # Bounds one model call, in seconds: each silent read, and the whole stream
     # (see core/llm.py). None means DEFAULT_CALL_TIMEOUT_SECONDS.
     timeout: int | None = None
@@ -61,8 +63,10 @@ class LLMResponse:
     thinking: str | None = None  # Responses API reasoning summaries
     reasoning: str | None = None  # Unset on the Responses path
     model: str = ""  # Model that actually responded
-    # The response's reasoning items, with their encrypted content, for the
-    # next request of the same conversation (requests are not stored).
+    # What the next request of the same conversation must send back with this
+    # turn: Responses reasoning items with their encrypted content (requests
+    # are not stored), or a Messages turn's content blocks with its thinking
+    # and the hash of the request it answered (core/llm_anthropic.py).
     reasoning_items: list[dict[str, Any]] | None = None
     # Why the response stopped early ("max_output_tokens", ...), or None when
     # it completed. The content and tool calls are then partial.

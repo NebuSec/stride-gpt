@@ -103,7 +103,10 @@ class RichProgress:
         self.console.print(f"    [dim]{escape(name)}({escape(args_brief)}){suffix}[/dim]")
 
     def error(self, name: str, reason: str) -> None:
-        self.console.print(f"  [red]Error analyzing {escape(name)}: {escape(reason)}[/red]")
+        # One line however narrow the console: see cli._report_provider_failure.
+        self.console.print(
+            f"  [red]Error analyzing {escape(name)}: {escape(reason)}[/red]", soft_wrap=True
+        )
 
     def token_budget(self, model: str, limit: int, source: str) -> None:
         if source == "queried" or source == "explicit":
@@ -127,7 +130,8 @@ class RichProgress:
     def synthesis_failed(self, reason: str) -> None:
         self.console.print(
             f"  [yellow]Synthesis failed, so this run has no cross-cutting threats. "
-            f"Subsystem findings are kept.\n  Reason: {escape(reason)}[/yellow]"
+            f"Subsystem findings are kept.\n  Reason: {escape(reason)}[/yellow]",
+            soft_wrap=True,
         )
 
     def complete(self, summary: str) -> None:

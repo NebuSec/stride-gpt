@@ -48,8 +48,8 @@ If you find STRIDE GPT useful, please consider supporting the project:
 - Generates Gherkin test cases based on identified threats
 - GitHub repository analysis for comprehensive threat modelling (including GitHub Enterprise support)
 - Multiple output formats: Markdown, JSON, SARIF (imports into GitHub, GitLab, Azure DevOps, IDEs), and a self-contained HTML view for sharing with stakeholders
-- Current model support (OpenAI GPT-6 series)
-- LLM calls through the official OpenAI SDK, using the native Responses API
+- Current model support (OpenAI GPT-6 series; Anthropic Claude Opus 5.5, Sonnet 5.5 and Haiku 5.5)
+- LLM calls through the official SDKs: OpenAI's native Responses API, and Anthropic's Messages API (`anthropic/` model prefix, `ANTHROPIC_API_KEY`)
 - No data storage; application details are not saved
 - Available as a Docker container image for easy deployment
 - Environment variable support for secure configuration
@@ -461,7 +461,7 @@ stride-gpt --version    # prints e.g. "stride-gpt 0.21.0" and exits
 | `-i`, `--input` | Read the app description from a file (`quick` only) |
 | `-y`, `--yes` | Auto-approve the analysis plan (`analyze` only) |
 | `--worker-model` | Default-tier model handling the bulk of calls (e.g. `openai/gpt-6-luna`). Uses saved config if omitted. |
-| `--architect-model` | Stronger model for planning/synthesis (e.g. `openai/gpt-6-sol`). Uses saved config if omitted. |
+| `--architect-model` | Stronger model for planning/synthesis (e.g. `openai/gpt-6-sol` or `anthropic/claude-opus-5-5`). Uses saved config if omitted. |
 | `--no-architect` | Skip the architect tier for this run; the worker handles every call. |
 | `--app-type` | Override the planner's detected app type (`analyze` only): `auto` (default), `web`, `genai`, `agentic`. |
 | `--max-llm-calls` | Cap LLM calls **per subsystem** (`analyze` only; default `25`, `0` = unlimited). Every subsystem gets the same budget and none is skipped for spending it: one that reaches the cap gets one final round to report what it found and is recorded `budget_exhausted`. The plan approval prompt shows the resulting ceiling for the whole run, `subsystems × (cap + 1) + 3` calls (synthesis may retry once, then the diagram). The interactive `/analyze` command uses the default. The default is about twice the measured reference: a complete 6-subsystem run against crAPI's identity service took about 11.8 exploration rounds per subsystem (71 exploration calls of 76 total). |

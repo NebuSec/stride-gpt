@@ -33,7 +33,7 @@ class TestClientKwargs:
         )
         assert _client_kwargs(cfg)["base_url"] == "https://gateway.example/v1"
 
-    @pytest.mark.parametrize("provider", ["Groq API", "LM Studio Server", "Anthropic API"])
+    @pytest.mark.parametrize("provider", ["Groq API", "LM Studio Server", "Google AI API"])
     def test_a_dropped_provider_from_a_saved_config_is_refused(self, provider):
         """It must not reach OpenAI's host with that provider's key and model."""
         cfg = LLMConfig(provider=provider, model_name="m", api_key="fake")

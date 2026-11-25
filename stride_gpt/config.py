@@ -13,7 +13,7 @@ from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
-from stride_gpt.models import PROVIDERS, get_models_for_provider
+from stride_gpt.models import PROVIDERS, get_models_for_provider, get_provider_by_key
 
 CONFIG_DIR = Path.home() / ".stride-gpt"
 
@@ -381,7 +381,9 @@ def get_api_key(config: dict[str, Any], *, tier: str = "worker") -> str:
     """
 
     provider = config.get(f"{tier}_provider", "")
-    provider_info = PROVIDERS.get(provider)
+    provider_info = PROVIDERS.get(provider) or get_provider_by_key(
+        config.get(f"{tier}_provider_key", "")
+    )
     if provider_info and provider_info.env_var:
         key = os.environ.get(provider_info.env_var, "")
         if key:
@@ -390,13 +392,21 @@ def get_api_key(config: dict[str, Any], *, tier: str = "worker") -> str:
     # Architect with no env-var key falls back to worker's key only when
     # both tiers share a provider.
     if tier == "architect":
-        worker_provider = config.get("worker_provider", "")
-        if worker_provider == provider:
+        # Compared by the resolved provider, never by possibly missing names:
+        # two absent display names are not the same provider.
+        worker_info = PROVIDERS.get(config.get("worker_provider", "")) or get_provider_by_key(
+            config.get("worker_provider_key", "")
+        )
+        if provider_info is not None and worker_info is provider_info:
             return get_api_key(config, tier="worker")
         return ""
 
-    # Worker tier — last-resort common env vars (legacy behaviour)
-    for var in ("STRIDE_GPT_API_KEY", "OPENAI_API_KEY"):
+    # Worker tier — last-resort common env vars (legacy behaviour). An OpenAI
+    # key is never offered to another provider.
+    fallbacks = ["STRIDE_GPT_API_KEY"]
+    if provider_info is None or provider_info.env_var == "OPENAI_API_KEY":
+        fallbacks.append("OPENAI_API_KEY")
+    for var in fallbacks:
         key = os.environ.get(var, "")
         if key:
             return key

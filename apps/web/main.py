@@ -753,6 +753,10 @@ def load_env_variables():
     if openai_api_key:
         st.session_state["openai_api_key"] = openai_api_key
 
+    anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+    if anthropic_api_key:
+        st.session_state["anthropic_api_key"] = anthropic_api_key
+
 
 # Call this function at the start of your app
 load_env_variables()
