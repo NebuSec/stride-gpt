@@ -3,8 +3,9 @@
 The agent loop used to decide what went wrong by searching the error text for
 ``"n_keep"`` or ``"crashed"``. That only ever recognised two local-model
 failures, and it silently reclassified anything whose wording changed. Every
-provider call goes through the OpenAI SDK, which raises typed exceptions carrying
-an HTTP status, so the type is the reliable signal and the text is the fallback.
+provider call goes through the OpenAI or the Anthropic SDK, both of which raise
+typed exceptions carrying an HTTP status, so the type is the reliable signal and
+the text is the fallback.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import json
 import re
 from typing import Any
 
+import anthropic
 import openai
 
 from stride_gpt.core.llm import ModelRefusalError
@@ -23,6 +25,8 @@ _CONTEXT_OVERFLOW_MARKERS = (
     "context_length_exceeded",
     "maximum context length",
     "exceeds the context window",
+    "prompt is too long",  # Anthropic
+    "exceed context limit",  # Anthropic: input length and max_tokens exceed context limit
 )
 
 _REASONS: dict[ErrorClass, str] = {
@@ -35,7 +39,7 @@ _REASONS: dict[ErrorClass, str] = {
 }
 
 
-def _is_context_overflow(exc: openai.BadRequestError) -> bool:
+def _is_context_overflow(exc: openai.BadRequestError | anthropic.BadRequestError) -> bool:
     """The SDK has no overflow class: it is a 400 told apart by code or wording."""
     if getattr(exc, "code", None) == "context_length_exceeded":
         return True
@@ -44,12 +48,24 @@ def _is_context_overflow(exc: openai.BadRequestError) -> bool:
 
 
 def _by_type(exc: BaseException) -> ErrorClass | None:
-    """Map an OpenAI SDK exception class to an error class."""
-    if isinstance(exc, openai.BadRequestError) and _is_context_overflow(exc):
+    """Map an OpenAI or Anthropic SDK exception class to an error class."""
+    if (
+        isinstance(exc, openai.BadRequestError | anthropic.BadRequestError)
+        and _is_context_overflow(exc)
+    ):
         return "context_overflow"
-    if isinstance(exc, openai.RateLimitError):
+    if isinstance(exc, openai.RateLimitError | anthropic.RateLimitError):
         return "rate_limited"
-    if isinstance(exc, openai.AuthenticationError | openai.PermissionDeniedError):
+    if isinstance(
+        exc,
+        openai.AuthenticationError
+        | openai.PermissionDeniedError
+        | anthropic.AuthenticationError
+        | anthropic.PermissionDeniedError
+        # The SDK found no usable credential (a profile, workload identity)
+        # before sending anything; not an APIError.
+        | anthropic.CredentialsError,
+    ):
         return "auth"
     return None
 
@@ -66,16 +82,36 @@ _CODE_CLASSES: dict[str, ErrorClass] = {
 }
 
 
+# Error types a Messages stream reports in an SSE `error` event, which arrives
+# with the stream's 200 status.
+_ANTHROPIC_TYPE_CLASSES: dict[str, ErrorClass] = {
+    "rate_limit_error": "rate_limited",
+    "authentication_error": "auth",
+    "permission_error": "auth",
+    "overloaded_error": "provider_error",
+    "api_error": "provider_error",
+    "timeout_error": "provider_error",
+}
+
+
 def _by_code(exc: BaseException) -> ErrorClass | None:
     """Map the error code a streamed failure carries to an error class."""
     code = getattr(exc, "code", None)
-    return _CODE_CLASSES.get(code) if isinstance(code, str) else None
+    if isinstance(code, str):
+        return _CODE_CLASSES.get(code)
+    body = getattr(exc, "body", None) if isinstance(exc, anthropic.APIError) else None
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error")
+    # {"type": "error", "error": {"type": ...}}, or a gateway's bare {"type": ...}.
+    kind = error.get("type") if isinstance(error, dict) else body.get("type")
+    return _ANTHROPIC_TYPE_CLASSES.get(kind) if isinstance(kind, str) else None
 
 
 def _by_provider_error(exc: BaseException) -> ErrorClass | None:
     """Whether ``exc`` is a failed provider call of some unclassified kind."""
     # Connection errors, timeouts, 5xx, and malformed requests.
-    return "provider_error" if isinstance(exc, openai.APIError) else None
+    return "provider_error" if isinstance(exc, openai.APIError | anthropic.APIError) else None
 
 
 def _by_status(exc: BaseException) -> ErrorClass | None:
@@ -111,6 +147,13 @@ def _message_from(body: object) -> str | None:
             return error
         if isinstance(body.get("message"), str):
             return body["message"]
+        # A gateway's own rejection (vega's LLM proxy: a cost cap, a request
+        # limit) is {"detail": "<message>"} or {"detail": {"message": ...}}.
+        detail = body.get("detail")
+        if isinstance(detail, str):
+            return detail
+        if isinstance(detail, dict) and isinstance(detail.get("message"), str):
+            return detail["message"]
     return None
 
 
@@ -129,12 +172,23 @@ def provider_message(exc: BaseException) -> str:
     return _REQUEST_ID.sub("", text).strip()
 
 
+def _http_status(exc: BaseException) -> int | None:
+    """The HTTP status of a refused request, or None (no response, or a
+    stream that failed after its 200)."""
+    status = getattr(exc, "status_code", None)
+    return status if isinstance(status, int) and status >= 400 else None
+
+
 def classify_error(exc: BaseException) -> tuple[ErrorClass, str]:
     """Return the error class for ``exc`` and the reason to show the user."""
     err_str = str(exc)
 
     if isinstance(exc, ModelRefusalError):
         return "provider_error", f"The model declined to answer: {err_str}"
+
+    # The Anthropic SDK found no credential to send (no key, token or profile).
+    if isinstance(exc, TypeError) and "could not resolve authentication method" in err_str.lower():
+        return "auth", "No API key was found for this model's provider."
 
     # Status before the generic provider check: a status on a wrapped exception
     # is more specific than "some API error".
@@ -150,6 +204,12 @@ def classify_error(exc: BaseException) -> tuple[ErrorClass, str]:
     if error_class is not None:
         reason = _REASONS[error_class]
         message = provider_message(exc)
+        # The HTTP status stays in the reason: a caller reading the CLI's
+        # output (vega's runner tells a billing stop, a 403 with the proxy's
+        # wording, from a refused key) has nothing else to go by.
+        status = _http_status(exc)
+        if status is not None:
+            message = f"HTTP {status}: {message}" if message else f"HTTP {status}"
         return error_class, f"{reason} ({message})" if message else reason
 
     # Last resort — a provider that wraps its errors, or a local runtime that

@@ -112,7 +112,7 @@ class OutputFormat(StrEnum):
 
 
 class ReasoningEffortOption(StrEnum):
-    """Responses `reasoning.effort`; see LLMConfig.reasoning_effort."""
+    """Reasoning effort; see LLMConfig.reasoning_effort."""
     none = "none"
     minimal = "minimal"
     low = "low"
@@ -378,13 +378,17 @@ def _report_provider_failure(exc: Exception) -> bool:
     from stride_gpt.agent.errors import classify_error
 
     error_class, reason = classify_error(exc)
+    # soft_wrap: one message stays one line however narrow the console. Rich
+    # wraps at 80 columns when stdout is not a terminal, and a caller reading
+    # this output (vega's runner) classifies the failure line by line.
     if error_class == "auth":
-        console.print(f"[red]Authentication failed. {reason}[/red]")
+        console.print(f"[red]Authentication failed. {reason}[/red]", soft_wrap=True)
         return True
     if error_class in ("provider_error", "rate_limited"):
+        console.print(f"[red]The provider call failed after retries. {reason}[/red]", soft_wrap=True)
         console.print(
-            f"[red]The provider call failed after retries. {reason}[/red]\n"
-            "Check the API base URL, your network connection and the provider's status."
+            "Check the API base URL, your network connection and the provider's status.",
+            soft_wrap=True,
         )
         return True
     return False
@@ -1044,17 +1048,17 @@ def analyze(
     path: Annotated[Path, typer.Argument(help="Path to the codebase to analyze.")] = Path(),
     worker_model: Annotated[str | None, typer.Option(help="Worker model — default tier, handles the bulk of calls (e.g. openai/gpt-6-luna). A fast, low-cost model usually pays off here. Uses saved config if omitted.")] = None,
     worker_api_key: Annotated[str | None, typer.Option(envvar="STRIDE_GPT_API_KEY", help="Worker API key.")] = None,
-    worker_api_base: Annotated[str | None, typer.Option(help="Worker API base URL (a Responses-compatible endpoint).")] = None,
+    worker_api_base: Annotated[str | None, typer.Option(help="Worker API base URL (OpenAI: a Responses-compatible endpoint; Anthropic: a Messages-compatible host, without /v1).")] = None,
     worker_max_tokens: Annotated[int | None, typer.Option(help="Worker per-call output token cap.")] = None,
     architect_model: Annotated[str | None, typer.Option(help="Architect model — used only for the reasoning-heavy moments (planning, cross-cutting synthesis, context summarization). Infrequent but high-leverage; a stronger model is worth the cost. Uses saved config if omitted.")] = None,
     architect_api_key: Annotated[str | None, typer.Option(help="Architect API key.")] = None,
-    architect_api_base: Annotated[str | None, typer.Option(help="Architect API base URL (a Responses-compatible endpoint).")] = None,
+    architect_api_base: Annotated[str | None, typer.Option(help="Architect API base URL (OpenAI: a Responses-compatible endpoint; Anthropic: a Messages-compatible host, without /v1).")] = None,
     architect_max_tokens: Annotated[int | None, typer.Option(help="Architect per-call output token cap.")] = None,
     no_architect: Annotated[bool, typer.Option("--no-architect", help="Bypass any saved architect tier for this run; worker handles every call.")] = False,
     worker_context_window: Annotated[int | None, typer.Option(min=1, help="Worker context window in tokens. Needed when the model id names a gateway route the model registry can't know; otherwise looked up.")] = None,
     architect_context_window: Annotated[int | None, typer.Option(min=1, help="Architect context window in tokens; see --worker-context-window.")] = None,
     call_timeout: Annotated[int | None, typer.Option(min=1, help=f"Seconds one model call may take, whole stream included (default {DEFAULT_CALL_TIMEOUT_SECONDS}).")] = None,
-    worker_reasoning_effort: Annotated[ReasoningEffortOption | None, typer.Option(help="Worker reasoning effort (Responses reasoning.effort). Unset leaves the model's default.")] = None,
+    worker_reasoning_effort: Annotated[ReasoningEffortOption | None, typer.Option(help="Worker reasoning effort (OpenAI reasoning.effort; Anthropic output_config.effort, low to max). Unset leaves the model's default.")] = None,
     architect_reasoning_effort: Annotated[ReasoningEffortOption | None, typer.Option(help="Architect reasoning effort; see --worker-reasoning-effort.")] = None,
     output: Annotated[Path | None, typer.Option("-o", "--output", help="Output file path.")] = None,
     output_format: Annotated[OutputFormat, typer.Option("-f", "--format", help="Output format.")] = OutputFormat.markdown,
@@ -1231,14 +1235,14 @@ def analyze(
 def quick(
     worker_model: Annotated[str | None, typer.Option(help="Worker model — default tier, handles fallback / retry calls. A fast, low-cost model is usually fine here. Uses saved config if omitted.")] = None,
     worker_api_key: Annotated[str | None, typer.Option(envvar="STRIDE_GPT_API_KEY", help="Worker API key.")] = None,
-    worker_api_base: Annotated[str | None, typer.Option(help="Worker API base URL (a Responses-compatible endpoint).")] = None,
+    worker_api_base: Annotated[str | None, typer.Option(help="Worker API base URL (OpenAI: a Responses-compatible endpoint; Anthropic: a Messages-compatible host, without /v1).")] = None,
     worker_max_tokens: Annotated[int | None, typer.Option(help="Worker per-call output token cap.")] = None,
     architect_model: Annotated[str | None, typer.Option(help="Architect model — drives the main single-shot threat-model judgment. A stronger reasoning model is worth the cost here. Uses saved config if omitted.")] = None,
     architect_api_key: Annotated[str | None, typer.Option(help="Architect API key.")] = None,
-    architect_api_base: Annotated[str | None, typer.Option(help="Architect API base URL (a Responses-compatible endpoint).")] = None,
+    architect_api_base: Annotated[str | None, typer.Option(help="Architect API base URL (OpenAI: a Responses-compatible endpoint; Anthropic: a Messages-compatible host, without /v1).")] = None,
     architect_max_tokens: Annotated[int | None, typer.Option(help="Architect per-call output token cap.")] = None,
     no_architect: Annotated[bool, typer.Option("--no-architect", help="Bypass any saved architect tier for this run; worker handles every call.")] = False,
-    worker_reasoning_effort: Annotated[ReasoningEffortOption | None, typer.Option(help="Worker reasoning effort (Responses reasoning.effort). Unset leaves the model's default.")] = None,
+    worker_reasoning_effort: Annotated[ReasoningEffortOption | None, typer.Option(help="Worker reasoning effort (OpenAI reasoning.effort; Anthropic output_config.effort, low to max). Unset leaves the model's default.")] = None,
     architect_reasoning_effort: Annotated[ReasoningEffortOption | None, typer.Option(help="Architect reasoning effort; see --worker-reasoning-effort.")] = None,
     input_file: Annotated[Path | None, typer.Option("-i", "--input", help="App description file.")] = None,
     app_type: Annotated[str | None, typer.Option(help="Optional hint about the application type (Web / Generative AI / Agentic AI application). Leave unset to let the agent decide which reference cards to load.")] = None,
@@ -1508,12 +1512,16 @@ def _build_model_pair(
         raise typer.Exit(1)
 
     if not worker_key:
-        console.print(_no_worker_key_message(worker_provider))
+        console.print(_no_worker_key_message(worker_provider), soft_wrap=True)
         raise typer.Exit(1)
 
-    if worker_api_base is None and saved:
+    # The saved endpoint and token cap belong to the saved provider: a
+    # --worker-model naming another one must not send its key to that
+    # endpoint, nor ask it for that provider's output cap.
+    saved_same_provider = bool(saved) and saved.get("worker_provider_key") == worker_provider
+    if worker_api_base is None and saved_same_provider:
         worker_api_base = saved.get("worker_api_base")
-    if worker_max_tokens is None and saved:
+    if worker_max_tokens is None and saved_same_provider:
         worker_max_tokens = saved.get("worker_max_tokens")
 
     worker = LLMConfig(
@@ -1537,7 +1545,8 @@ def _build_model_pair(
         if not a_key:
             console.print(
                 f"[red]Architect API key for {a_provider} could not be resolved. "
-                f"Set the provider's env var or pass --architect-api-key.[/red]"
+                f"Set the provider's env var or pass --architect-api-key.[/red]",
+                soft_wrap=True,
             )
             raise typer.Exit(1)
         architect = LLMConfig(
@@ -1563,7 +1572,28 @@ def _build_model_pair(
             )
             raise typer.Exit(1)
 
+    for tier in (worker, architect):
+        _check_effort(tier)
     return ModelPair(worker=worker, architect=architect)
+
+
+def _check_effort(config) -> None:
+    """Refuse an effort the tier's protocol can't take, before any model call.
+
+    Checked here rather than at the first call to that tier, which may come
+    after the other tier has already planned (and been paid for).
+    """
+    from stride_gpt.models import get_provider_by_key
+
+    provider = get_provider_by_key(config.provider) if config is not None else None
+    if provider is None or provider.api != "messages" or not config.reasoning_effort:
+        return
+    from stride_gpt.core.llm_anthropic import effort_problem
+
+    problem = effort_problem(config.reasoning_effort)
+    if problem:
+        console.print(f"[red]{config.model_name}: {problem}[/red]", soft_wrap=True)
+        raise typer.Exit(2)
 
 
 def _effort(value: str | None) -> str | None:

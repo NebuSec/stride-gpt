@@ -16,6 +16,7 @@ from stride_gpt.core.schemas import LLMConfig
 # provider_key (LLMConfig.provider) -> st.session_state key holding the API key.
 PROVIDER_API_KEY_STATE: dict[str, str] = {
     "OpenAI API": "openai_api_key",
+    "Anthropic API": "anthropic_api_key",
 }
 
 

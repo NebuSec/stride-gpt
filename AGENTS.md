@@ -27,7 +27,8 @@ stride_gpt/                 # CLI package + shared library
 │   ├── progress.py         # Rich-based progress callbacks
 │   └── report.py           # markdown / JSON / SARIF rendering, save/load
 └── core/                   # shared between CLI and web
-    ├── llm.py              # unified call_llm / call_llm_with_tools (OpenAI SDK)
+    ├── llm.py              # unified call_llm / call_llm_with_tools; OpenAI Responses
+    ├── llm_anthropic.py    # the Anthropic Messages side of llm.py
     ├── schemas.py          # LLMConfig, AnalysisPlan, AnalysisReport, etc.
     ├── prompts/
     │   ├── builder.py      # legacy single-shot prompt builder (web UI uses this)
@@ -146,16 +147,20 @@ The pattern is decoupled from threat modelling. The recipe:
 ## LLM provider abstraction
 
 Everything goes through `stride_gpt/core/llm.py` — `call_llm`, `call_llm_with_tools`, `call_llm_with_image`.
-Under the hood these use the official OpenAI SDK against the **Responses API**, the only protocol this fork supports.
-**Never construct `OpenAI()` outside `core/llm.py`** — that's how provider-specific quirks leak across the codebase.
+Each provider's `ProviderInfo.api` picks the wire protocol:
 
-Agent history stays in Chat Completions shape and is converted at this boundary (`messages_to_responses_input`, flat function tools).
-`LLMConfig.api_base` is passed through as the SDK's `base_url`, for a gateway that speaks Responses.
+- `"responses"`: the official OpenAI SDK against the **Responses API** (`core/llm.py`); the `OpenAI` provider, `openai/` prefix.
+- `"messages"`: the official Anthropic SDK against the **Messages API** (`core/llm_anthropic.py`); the `Anthropic` provider, `anthropic/` prefix, `ANTHROPIC_API_KEY`.
 
-Models are registered in `stride_gpt/models.py` with provider, default tokens, max tokens, and capability flags (`uses_max_completion_tokens`).
-`OpenAI` is the only registered provider; `_client_kwargs` refuses any other, so an old saved config can't send a request to the wrong service.
+**Never construct `OpenAI()` or `Anthropic()` outside those two modules** — that's how provider-specific quirks leak across the codebase.
 
-### Provider gotchas
+Agent history stays in Chat Completions shape and is converted at this boundary (`messages_to_responses_input`, flat function tools; `messages_to_anthropic`, `tool_result` blocks).
+`LLMConfig.api_base` is passed through as the SDK's `base_url`, for a gateway that speaks the provider's protocol.
+
+Models are registered in `stride_gpt/models.py` with provider, default tokens, max tokens, and capability flags (`uses_max_completion_tokens`, `refusal_fallback`).
+`OpenAI` and `Anthropic` are the registered providers; `_client_kwargs` refuses any other, so an old saved config can't send a request to the wrong service.
+
+### Provider gotchas (Responses)
 
 - **Responses must set `store=False`.** Default storage would persist threat-model prompts (including source) on OpenAI's side.
 - **GPT-5 and later use `max_output_tokens` on Responses.** Driven off `_default_output_tokens` and the model registry.
@@ -174,6 +179,26 @@ Models are registered in `stride_gpt/models.py` with provider, default tokens, m
   When only the system message asks for JSON, `_responses_call_kwargs` sends it as the first `input` item instead of as `instructions`.
 - **A gateway route names no model**, so the registry can't know its context window: pass `--worker-context-window` / `--architect-context-window` (`LLMConfig.context_window`).
 - **The SDK has no context-overflow exception.** It arrives as a 400, told apart by `code` or wording in `agent/errors.py:_is_context_overflow`.
+
+### Provider gotchas (Messages)
+
+- **Every call streams and is bounded the same way** (`_stream_message`, `STREAM_ATTEMPTS`, `LLMConfig.timeout`).
+  The SDK retries before the stream opens; a stream that drops, ends before `message_stop`, or reports `overloaded_error` / `api_error` / `timeout_error` as an SSE `error` event is retried here.
+  Once the body is streaming the SDK raises transport faults raw (`httpx2.TransportError`), so `_read_stream` wraps them as `APIConnectionError`; tool-input JSON the SDK can't parse is sampled again the same way.
+- **A tool call cut off by `max_tokens` is not run.** The SDK completes partial tool JSON, so the last call of a `max_tokens` stop is returned with a `parse_error`.
+- **`max_tokens` is required.** It is `LLMConfig.max_tokens`, else the registry's `default_tokens`, else `DEFAULT_MAX_TOKENS` for a model the registry doesn't know.
+- **Claude thinking blocks are bound to the request that produced them.** The API refuses a replayed block once the model, `system`, `tools` or any earlier message changed, and context compression and the grace round's tool swap change exactly those.
+  Each Claude turn keeps its content blocks and a hash of its request in `reasoning_items` (`"type": "anthropic_turn"`); `messages_to_anthropic` replays a turn verbatim while its request hashes the same, and rebuilds it without thinking otherwise.
+  Build the history message with `assistant_tool_turn`, as for Responses, and never edit a stored turn.
+  Each protocol skips the other's items, so a conversation can change provider.
+  A turn a server-side fallback model served is stored unbound and so replayed without its thinking.
+- **There is no JSON mode.** `response_format="json"` sends nothing (the prompts ask for JSON, callers extract it); a schema dict becomes `output_config.format` through `anthropic.transform_schema`, which adds the `additionalProperties: false` structured outputs require.
+- **Effort is `output_config.effort`**, `low` to `max`; `none` and `minimal` are refused before the request. Thinking is adaptive and left to the model (no `thinking` parameter).
+- **`api_base` names the host, not `.../v1`**: the SDK appends `/v1/messages`.
+- **Registered models with `refusal_fallback`** (Opus 5.5, Sonnet 5.5) go through `client.beta.messages` with `server-side-fallback-2026-07-01` and `fallbacks: "default"` when no gateway is set (`api_base` or `ANTHROPIC_BASE_URL`): on a safety refusal the API re-runs the request on a fallback model. Through a gateway they are not sent, since it need not pass on a beta it doesn't know. A `refusal` stop that remains raises `ModelRefusalError`.
+- **Every call asks for automatic prompt caching** (top-level `cache_control`); usage folds cache reads and writes back into `prompt_tokens`, with the reads as `cached_prompt_tokens`.
+- **Mid-stream errors carry the stream's 200**, so `agent/errors.py` classifies them by the body's error `type`.
+- **A refused request's reason keeps its HTTP status** (`classify_error`: `... (HTTP 403: <message>)`), and a gateway's `{"detail": ...}` body is read as its message. vega's runner reads the CLI's output to tell a billing stop (a 403 with the proxy's cost-cap wording) from a refused key; keep both in the printed reason.
 
 ## Adding a feature — orientation
 

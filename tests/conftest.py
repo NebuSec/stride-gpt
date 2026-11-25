@@ -80,6 +80,21 @@ def _hermetic_api_keys(monkeypatch):
     # Not a provider's own variable, but the worker tier's last-resort fallback
     # reads it, so a stale value here reaches the same code paths.
     names.add("STRIDE_GPT_API_KEY")
+    # The Anthropic SDK reads these itself when no value is passed in: a
+    # developer's gateway or profile would change what a test sends.
+    names.update(
+        {
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "ANTHROPIC_PROFILE",
+            "ANTHROPIC_CONFIG_DIR",
+            "ANTHROPIC_IDENTITY_TOKEN",
+            "ANTHROPIC_IDENTITY_TOKEN_FILE",
+            "ANTHROPIC_FEDERATION_RULE_ID",
+            "ANTHROPIC_ORGANIZATION_ID",
+        }
+    )
     for name in sorted(names):
         monkeypatch.delenv(name, raising=False)
 

@@ -1,15 +1,17 @@
 """Unified model registry — single source of truth for providers and models.
 
 To add or update a model, edit the MODELS list below. No other files need to change.
-Last reviewed: 2026-09-26
+Last reviewed: 2026-11-25
 
-Provider model listing page:
+Provider model listing pages:
   - OpenAI: https://developers.openai.com/api/docs/models
+  - Anthropic: https://platform.claude.com/docs/en/about-claude/models/overview
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -20,6 +22,9 @@ class ProviderInfo:
     provider_key: str  # Routing key used in LLMConfig.provider
     env_var: str | None = None
     cli_prefix: str = ""  # e.g. "openai/" for --worker-model openai/gpt-6-sol
+    # The wire protocol core/llm.py speaks to this provider: "responses" (the
+    # OpenAI SDK's Responses API) or "messages" (the Anthropic SDK's Messages API).
+    api: Literal["responses", "messages"] = "responses"
     api_key_url: str = ""
     setup_instructions: str = ""
 
@@ -34,6 +39,9 @@ class ModelInfo:
     max_tokens: int = 128000
     uses_max_completion_tokens: bool = False  # reasoning models
     supports_tools: bool = True
+    # Messages API only: on a safety refusal, have the API re-run the request on
+    # a fallback model it picks (beta server-side fallbacks, `fallbacks: "default"`).
+    refusal_fallback: bool = False
     help_text: str = ""
 
 
@@ -50,6 +58,20 @@ PROVIDERS: dict[str, ProviderInfo] = {
         api_key_url="https://platform.openai.com/account/api-keys",
         setup_instructions=(
             "1. Enter your [OpenAI API key](https://platform.openai.com/account/api-keys) "
+            "and chosen model below 🔑\n"
+            "2. Provide details of the application that you would like to threat model  📝\n"
+            "3. Generate a threat list, attack tree and/or mitigating controls for your application 🚀"
+        ),
+    ),
+    "Anthropic": ProviderInfo(
+        name="Anthropic",
+        provider_key="Anthropic API",
+        env_var="ANTHROPIC_API_KEY",
+        cli_prefix="anthropic/",
+        api="messages",
+        api_key_url="https://platform.claude.com/settings/keys",
+        setup_instructions=(
+            "1. Enter your [Anthropic API key](https://platform.claude.com/settings/keys) "
             "and chosen model below 🔑\n"
             "2. Provide details of the application that you would like to threat model  📝\n"
             "3. Generate a threat list, attack tree and/or mitigating controls for your application 🚀"
@@ -87,6 +109,37 @@ MODELS: list[ModelInfo] = [
         max_tokens=1050000,
         uses_max_completion_tokens=True,
         help_text="GPT-6 Luna is the most efficient option for focused, high-volume tasks.",
+    ),
+    # --- Anthropic ---
+    # Thinking is adaptive and on by default on all three; effort is the only
+    # control (output_config.effort, from LLMConfig.reasoning_effort).
+    # max_tokens is the context window (agent/context.py reads it as one);
+    # default_tokens is the per-call output cap, sent as the required max_tokens.
+    ModelInfo(
+        model_id="claude-opus-5-5",
+        provider_key="Anthropic API",
+        default_tokens=64000,
+        max_tokens=1000000,
+        uses_max_completion_tokens=True,
+        refusal_fallback=True,
+        help_text="Claude Opus 5.5 is Anthropic's default model for complex reasoning and agentic work.",
+    ),
+    ModelInfo(
+        model_id="claude-sonnet-5-5",
+        provider_key="Anthropic API",
+        default_tokens=64000,
+        max_tokens=1000000,
+        uses_max_completion_tokens=True,
+        refusal_fallback=True,
+        help_text="Claude Sonnet 5.5 balances speed and capability for everyday coding and agent work.",
+    ),
+    ModelInfo(
+        model_id="claude-haiku-5-5",
+        provider_key="Anthropic API",
+        default_tokens=64000,
+        max_tokens=1000000,
+        uses_max_completion_tokens=True,
+        help_text="Claude Haiku 5.5 is the fastest, lowest-cost option for focused, high-volume tasks.",
     ),
 ]
 

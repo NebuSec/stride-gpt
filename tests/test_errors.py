@@ -140,7 +140,7 @@ class TestProviderMessage:
         )
         assert classify_error(exc) == (
             "auth",
-            "The provider rejected the credentials for this model. (Bad key)",
+            "The provider rejected the credentials for this model. (HTTP 401: Bad key)",
         )
 
     def test_a_nested_error_message_is_extracted(self):
@@ -149,7 +149,7 @@ class TestProviderMessage:
             status=401,
             body={"error": {"type": "authentication_error", "message": "invalid x-api-key"}},
         )
-        assert classify_error(exc)[1].endswith("(invalid x-api-key)")
+        assert classify_error(exc)[1].endswith("(HTTP 401: invalid x-api-key)")
 
     def test_a_json_text_is_read_when_there_is_no_body(self):
         exc = status_error(
@@ -157,7 +157,7 @@ class TestProviderMessage:
             message='Error code: 500 - {"error": {"message": "upstream died"}}',
             status=500,
         )
-        assert classify_error(exc)[1].endswith("(upstream died)")
+        assert classify_error(exc)[1].endswith("(HTTP 500: upstream died)")
 
     def test_a_plain_text_error_keeps_its_text(self):
         exc = connection_error()
